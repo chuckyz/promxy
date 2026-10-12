@@ -16,20 +16,21 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"log/slog"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/pkg/errors"
+	"github.com/grafana/regexp"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/common/version"
 
 	"github.com/prometheus/prometheus/discovery"
@@ -40,10 +41,10 @@ import (
 var (
 	// DefaultSDConfig is the default HTTP SD configuration.
 	DefaultSDConfig = SDConfig{
-		RefreshInterval:  model.Duration(60 * time.Second),
 		HTTPClientConfig: config.DefaultHTTPClientConfig,
+		RefreshInterval:  model.Duration(60 * time.Second),
 	}
-	userAgent        = fmt.Sprintf("Prometheus/%s", version.Version)
+	userAgent        = version.PrometheusUserAgent()
 	matchContentType = regexp.MustCompile(`^(?i:application\/json(;\s*charset=("utf-8"|utf-8))?)$`)
 )
 
@@ -58,12 +59,17 @@ type SDConfig struct {
 	URL              string                  `yaml:"url"`
 }
 
+// NewDiscovererMetrics implements discovery.Config.
+func (*SDConfig) NewDiscovererMetrics(reg prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
+	return newDiscovererMetrics(reg, rmi)
+}
+
 // Name returns the name of the Config.
 func (*SDConfig) Name() string { return "http" }
 
 // NewDiscoverer returns a Discoverer for the Config.
 func (c *SDConfig) NewDiscoverer(opts discovery.DiscovererOptions) (discovery.Discoverer, error) {
-	return NewDiscovery(c, opts.Logger)
+	return NewDiscovery(c, opts.Logger, opts.HTTPClientOptions, opts.Metrics)
 }
 
 // SetDirectory joins any relative file paths with dir.
@@ -80,19 +86,19 @@ func (c *SDConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 	if c.URL == "" {
-		return fmt.Errorf("URL is missing")
+		return errors.New("URL is missing")
 	}
 	parsedURL, err := url.Parse(c.URL)
 	if err != nil {
 		return err
 	}
 	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
-		return fmt.Errorf("URL scheme must be 'http' or 'https'")
+		return errors.New("URL scheme must be 'http' or 'https'")
 	}
 	if parsedURL.Host == "" {
-		return fmt.Errorf("host is missing in URL")
+		return errors.New("host is missing in URL")
 	}
-	return nil
+	return c.HTTPClientConfig.Validate()
 }
 
 const httpSDURLLabel = model.MetaLabelPrefix + "url"
@@ -105,15 +111,21 @@ type Discovery struct {
 	client          *http.Client
 	refreshInterval time.Duration
 	tgLastLength    int
+	metrics         *httpMetrics
 }
 
 // NewDiscovery returns a new HTTP discovery for the given config.
-func NewDiscovery(conf *SDConfig, logger log.Logger) (*Discovery, error) {
-	if logger == nil {
-		logger = log.NewNopLogger()
+func NewDiscovery(conf *SDConfig, logger *slog.Logger, clientOpts []config.HTTPClientOption, metrics discovery.DiscovererMetrics) (*Discovery, error) {
+	m, ok := metrics.(*httpMetrics)
+	if !ok {
+		return nil, errors.New("invalid discovery metrics type")
 	}
 
-	client, err := config.NewClientFromConfig(conf.HTTPClientConfig, "http", config.WithHTTP2Disabled())
+	if logger == nil {
+		logger = promslog.NewNopLogger()
+	}
+
+	client, err := config.NewClientFromConfig(conf.HTTPClientConfig, "http", clientOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -123,19 +135,23 @@ func NewDiscovery(conf *SDConfig, logger log.Logger) (*Discovery, error) {
 		url:             conf.URL,
 		client:          client,
 		refreshInterval: time.Duration(conf.RefreshInterval), // Stored to be sent as headers.
+		metrics:         m,
 	}
 
 	d.Discovery = refresh.NewDiscovery(
-		logger,
-		"http",
-		time.Duration(conf.RefreshInterval),
-		d.refresh,
+		refresh.Options{
+			Logger:              logger,
+			Mech:                "http",
+			Interval:            time.Duration(conf.RefreshInterval),
+			RefreshF:            d.Refresh,
+			MetricsInstantiator: m.refreshMetrics,
+		},
 	)
 	return d, nil
 }
 
-func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
-	req, err := http.NewRequest("GET", d.url, nil)
+func (d *Discovery) Refresh(ctx context.Context) ([]*targetgroup.Group, error) {
+	req, err := http.NewRequest(http.MethodGet, d.url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -145,34 +161,40 @@ func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 
 	resp, err := d.client.Do(req.WithContext(ctx))
 	if err != nil {
+		d.metrics.failuresCount.Inc()
 		return nil, err
 	}
 	defer func() {
-		io.Copy(ioutil.Discard, resp.Body)
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("server returned HTTP status %s", resp.Status)
+		d.metrics.failuresCount.Inc()
+		return nil, fmt.Errorf("server returned HTTP status %s", resp.Status)
 	}
 
 	if !matchContentType.MatchString(strings.TrimSpace(resp.Header.Get("Content-Type"))) {
-		return nil, errors.Errorf("unsupported content type %q", resp.Header.Get("Content-Type"))
+		d.metrics.failuresCount.Inc()
+		return nil, fmt.Errorf("unsupported content type %q", resp.Header.Get("Content-Type"))
 	}
 
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
+		d.metrics.failuresCount.Inc()
 		return nil, err
 	}
 
 	var targetGroups []*targetgroup.Group
 
 	if err := json.Unmarshal(b, &targetGroups); err != nil {
+		d.metrics.failuresCount.Inc()
 		return nil, err
 	}
 
 	for i, tg := range targetGroups {
 		if tg == nil {
+			d.metrics.failuresCount.Inc()
 			err = errors.New("nil target group item found")
 			return nil, err
 		}

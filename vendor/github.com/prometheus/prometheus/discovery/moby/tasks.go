@@ -19,7 +19,6 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/prometheus/common/model"
 
@@ -28,14 +27,14 @@ import (
 )
 
 const (
-	swarmLabelTaskPrefix       = swarmLabel + "task_"
-	swarmLabelTaskID           = swarmLabelTaskPrefix + "id"
-	swarmLabelTaskLabelPrefix  = swarmLabelTaskPrefix + "label_"
-	swarmLabelTaskDesiredState = swarmLabelTaskPrefix + "desired_state"
-	swarmLabelTaskStatus       = swarmLabelTaskPrefix + "state"
-	swarmLabelTaskContainerID  = swarmLabelTaskPrefix + "container_id"
-	swarmLabelTaskSlot         = swarmLabelTaskPrefix + "slot"
-	swarmLabelTaskPortMode     = swarmLabelTaskPrefix + "port_publish_mode"
+	swarmLabelTaskPrefix           = swarmLabel + "task_"
+	swarmLabelTaskID               = swarmLabelTaskPrefix + "id"
+	swarmLabelTaskDesiredState     = swarmLabelTaskPrefix + "desired_state"
+	swarmLabelTaskStatus           = swarmLabelTaskPrefix + "state"
+	swarmLabelTaskContainerID      = swarmLabelTaskPrefix + "container_id"
+	swarmLabelTaskSlot             = swarmLabelTaskPrefix + "slot"
+	swarmLabelTaskPortMode         = swarmLabelTaskPrefix + "port_publish_mode"
+	swarmLabelContainerLabelPrefix = swarmLabel + "container_label_"
 )
 
 func (d *Discovery) refreshTasks(ctx context.Context) ([]*targetgroup.Group, error) {
@@ -43,7 +42,7 @@ func (d *Discovery) refreshTasks(ctx context.Context) ([]*targetgroup.Group, err
 		Source: "DockerSwarm",
 	}
 
-	tasks, err := d.client.TaskList(ctx, types.TaskListOptions{Filters: d.filters})
+	tasks, err := d.client.TaskList(ctx, swarm.TaskListOptions{Filters: d.filters})
 	if err != nil {
 		return nil, fmt.Errorf("error while listing swarm services: %w", err)
 	}
@@ -75,9 +74,11 @@ func (d *Discovery) refreshTasks(ctx context.Context) ([]*targetgroup.Group, err
 			commonLabels[swarmLabelTaskContainerID] = s.Status.ContainerStatus.ContainerID
 		}
 
-		for k, v := range s.Labels {
-			ln := strutil.SanitizeLabelName(k)
-			commonLabels[swarmLabelTaskLabelPrefix+ln] = v
+		if s.Spec.ContainerSpec != nil {
+			for k, v := range s.Spec.ContainerSpec.Labels {
+				ln := strutil.SanitizeLabelName(k)
+				commonLabels[swarmLabelContainerLabelPrefix+ln] = v
+			}
 		}
 
 		for k, v := range serviceLabels[s.ServiceID] {
@@ -148,7 +149,7 @@ func (d *Discovery) refreshTasks(ctx context.Context) ([]*targetgroup.Group, err
 						labels[model.LabelName(k)] = model.LabelValue(v)
 					}
 
-					addr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", d.port))
+					addr := net.JoinHostPort(ip.String(), strconv.Itoa(d.port))
 					labels[model.AddressLabel] = model.LabelValue(addr)
 
 					tg.Targets = append(tg.Targets, labels)

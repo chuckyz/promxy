@@ -2,53 +2,101 @@ package promclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/url"
+	"reflect"
+	"slices"
+	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
+
+	"github.com/jacksontj/promxy/pkg/promapi"
 )
 
 type stubAPI struct {
-	labelNames  func() []string
-	labelValues func() model.LabelValues
-	query       func() model.Value
-	queryRange  func() model.Value
-	series      func() []model.LabelSet
-	getValue    func() model.Value
+	labelNames     func() []string
+	labelValues    func(label string) model.LabelValues
+	query          func() model.Value
+	queryRange     func(q string, r v1.Range) model.Value
+	series         func() []model.LabelSet
+	getValue       func() model.Value
+	metadata       func() map[string][]v1.Metadata
+	queryExemplars func() []v1.ExemplarQueryResult
 }
 
 // LabelNames returns all the unique label names present in the block in sorted order.
 func (s *stubAPI) LabelNames(ctx context.Context, matchers []string, startTime time.Time, endTime time.Time) ([]string, v1.Warnings, error) {
+	if s.labelNames == nil {
+		return nil, nil, nil
+	}
 	return s.labelNames(), nil, nil
 }
 
 // LabelValues performs a query for the values of the given label.
 func (s *stubAPI) LabelValues(ctx context.Context, label string, matchers []string, startTime time.Time, endTime time.Time) (model.LabelValues, v1.Warnings, error) {
-	return s.labelValues(), nil, nil
+	if s.labelValues == nil {
+		return nil, nil, nil
+	}
+	return s.labelValues(label), nil, nil
 }
 
 // Query performs a query for the given time.
-func (s *stubAPI) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
-	return s.query(), nil, nil
+func (s *stubAPI) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
+	if s.query == nil {
+		return storage.EmptySeriesSet()
+	}
+	return ModelValueToSeriesSet(s.query(), nil, nil)
 }
 
 // QueryRange performs a query for the given range.
-func (s *stubAPI) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
-	return s.queryRange(), nil, nil
+func (s *stubAPI) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
+	if s.queryRange == nil {
+		return storage.EmptySeriesSet()
+	}
+	return ModelValueToSeriesSet(s.queryRange(query, r), nil, nil)
 }
 
 // Series finds series by label matchers.
 func (s *stubAPI) Series(ctx context.Context, matches []string, startTime time.Time, endTime time.Time) ([]model.LabelSet, v1.Warnings, error) {
+	if s.series == nil {
+		return nil, nil, nil
+	}
 	return s.series(), nil, nil
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (s *stubAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
-	return s.getValue(), nil, nil
+func (s *stubAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
+	if s.getValue == nil {
+		return storage.EmptySeriesSet()
+	}
+	return ModelValueToSeriesSet(s.getValue(), nil, nil)
+}
+
+// Metadata returns metadata about metrics currently scraped by the metric name.
+func (s *stubAPI) Metadata(ctx context.Context, metric, limit string) (map[string][]v1.Metadata, error) {
+	if s.metadata == nil {
+		return nil, nil
+	}
+	return s.metadata(), nil
+}
+
+// QueryExemplars performs a query for exemplars by the given query and time range.
+func (s *stubAPI) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
+	if s.queryExemplars == nil {
+		return nil, nil
+	}
+	return s.queryExemplars(), nil
 }
 
 type errorAPI struct {
@@ -79,17 +127,17 @@ func (s *errorAPI) LabelValues(ctx context.Context, label string, matchers []str
 }
 
 // Query performs a query for the given time.
-func (s *errorAPI) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
+func (s *errorAPI) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
 	if s.err != nil {
-		return nil, nil, s.err
+		return storage.ErrSeriesSet(s.err)
 	}
 	return s.Query(ctx, query, ts)
 }
 
 // QueryRange performs a query for the given range.
-func (s *errorAPI) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
+func (s *errorAPI) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
 	if s.err != nil {
-		return nil, nil, s.err
+		return storage.ErrSeriesSet(s.err)
 	}
 	return s.QueryRange(ctx, query, r)
 }
@@ -103,11 +151,19 @@ func (s *errorAPI) Series(ctx context.Context, matches []string, startTime time.
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (s *errorAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
+func (s *errorAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
 	if s.err != nil {
-		return nil, nil, s.err
+		return storage.ErrSeriesSet(s.err)
 	}
 	return s.GetValue(ctx, start, end, matchers)
+}
+
+// QueryExemplars performs a query for exemplars by the given query and time range.
+func (s *errorAPI) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.QueryExemplars(ctx, query, startTime, endTime)
 }
 
 func TestMultiAPIMerging(t *testing.T) {
@@ -124,7 +180,7 @@ func TestMultiAPIMerging(t *testing.T) {
 			return []string{"a"}
 		},
 
-		labelValues: func() model.LabelValues {
+		labelValues: func(_ string) model.LabelValues {
 			return model.LabelValues{}
 		},
 		query: func() model.Value {
@@ -132,7 +188,7 @@ func TestMultiAPIMerging(t *testing.T) {
 				getSample(model.LabelSet{model.MetricNameLabel: "testmetric"}),
 			}
 		},
-		queryRange: func() model.Value {
+		queryRange: func(_ string, _ v1.Range) model.Value {
 			return model.Vector{
 				getSample(model.LabelSet{model.MetricNameLabel: "testmetric"}),
 			}
@@ -178,10 +234,10 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// Ensure a single layer of multi merges
 		{
-			a: NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
 				&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 				&AddLabelClient{stub, model.LabelSet{"a": "2"}},
-			}, model.Time(0), nil, 1),
+			}, model.Time(0), false, nil, 1, false),
 			labelNames:  []string{"a"},
 			labelValues: []model.LabelValue{"1", "2"},
 			v: model.Vector{
@@ -195,16 +251,16 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// Ensure that a tree of multis work
 		{
-			a: NewMultiAPI([]API{
-				NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
+				NewMustMultiAPI([]API{
 					&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 					&AddLabelClient{stub, model.LabelSet{"a": "1"}},
-				}, model.Time(0), nil, 1),
-				NewMultiAPI([]API{
+				}, model.Time(0), false, nil, 1, false),
+				NewMustMultiAPI([]API{
 					&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 					&AddLabelClient{stub, model.LabelSet{"a": "2"}},
-				}, model.Time(0), nil, 1),
-			}, model.Time(0), nil, 2),
+				}, model.Time(0), false, nil, 1, false),
+			}, model.Time(0), false, nil, 2, false),
 			labelNames:  []string{"a"},
 			labelValues: []model.LabelValue{"1", "2"},
 			v: model.Vector{
@@ -218,28 +274,28 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// Ensure that a multi-level tree of multis work
 		{
-			a: NewMultiAPI([]API{
-				NewMultiAPI([]API{
-					NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
+				NewMustMultiAPI([]API{
+					NewMustMultiAPI([]API{
 						&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 						&AddLabelClient{stub, model.LabelSet{"a": "1"}},
-					}, model.Time(0), nil, 1),
-					NewMultiAPI([]API{
+					}, model.Time(0), false, nil, 1, false),
+					NewMustMultiAPI([]API{
 						&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 						&AddLabelClient{stub, model.LabelSet{"a": "2"}},
-					}, model.Time(0), nil, 1),
-				}, model.Time(0), nil, 2),
-				NewMultiAPI([]API{
-					NewMultiAPI([]API{
+					}, model.Time(0), false, nil, 1, false),
+				}, model.Time(0), false, nil, 2, false),
+				NewMustMultiAPI([]API{
+					NewMustMultiAPI([]API{
 						&AddLabelClient{stub, model.LabelSet{"b": "1"}},
 						&AddLabelClient{stub, model.LabelSet{"b": "1"}},
-					}, model.Time(0), nil, 1),
-					NewMultiAPI([]API{
+					}, model.Time(0), false, nil, 1, false),
+					NewMustMultiAPI([]API{
 						&AddLabelClient{stub, model.LabelSet{"b": "2"}},
 						&AddLabelClient{stub, model.LabelSet{"b": "2"}},
-					}, model.Time(0), nil, 1),
-				}, model.Time(0), nil, 2),
-			}, model.Time(0), nil, 2),
+					}, model.Time(0), false, nil, 1, false),
+				}, model.Time(0), false, nil, 2, false),
+			}, model.Time(0), false, nil, 2, false),
 			labelNames:  []string{"a", "b"},
 			labelValues: []model.LabelValue{"1", "2"},
 			v: model.Vector{
@@ -264,16 +320,16 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// In a tree, if a single node errors for each, we should still return no-error
 		{
-			a: NewMultiAPI([]API{
-				NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
+				NewMustMultiAPI([]API{
 					&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "1"}}, fmt.Errorf("")},
 					&AddLabelClient{stub, model.LabelSet{"a": "1"}},
-				}, model.Time(0), nil, 1),
-				NewMultiAPI([]API{
+				}, model.Time(0), false, nil, 1, false),
+				NewMustMultiAPI([]API{
 					&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "2"}}, fmt.Errorf("")},
 					&AddLabelClient{stub, model.LabelSet{"a": "2"}},
-				}, model.Time(0), nil, 1),
-			}, model.Time(0), nil, 2),
+				}, model.Time(0), false, nil, 1, false),
+			}, model.Time(0), false, nil, 2, false),
 			labelNames:  []string{"a"},
 			labelValues: []model.LabelValue{"1", "2"},
 			v: model.Vector{
@@ -287,33 +343,33 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// In a tree, if any tree has all errors, we expect an error
 		{
-			a: NewMultiAPI([]API{
-				NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
+				NewMustMultiAPI([]API{
 					&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "1"}}, fmt.Errorf("")},
 					&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "1"}}, fmt.Errorf("")},
-				}, model.Time(0), nil, 1),
-				NewMultiAPI([]API{
+				}, model.Time(0), false, nil, 1, false),
+				NewMustMultiAPI([]API{
 					&AddLabelClient{stub, model.LabelSet{"a": "2"}},
 					&AddLabelClient{stub, model.LabelSet{"a": "2"}},
-				}, model.Time(0), nil, 1),
-			}, model.Time(0), nil, 2),
+				}, model.Time(0), false, nil, 1, false),
+			}, model.Time(0), false, nil, 2, false),
 			err: true,
 		},
 		// if in a multi, all that "match" error, we should error
 		{
-			a: NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
 				&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "1"}}, fmt.Errorf("")},
 				&AddLabelClient{stub, model.LabelSet{"a": "2"}},
-			}, model.Time(0), nil, 1),
+			}, model.Time(0), false, nil, 1, false),
 			err: true,
 		},
 		// however, in a multi if a single one succeeds for a given "group" then it should pass
 		{
-			a: NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
 				&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 				&errorAPI{&AddLabelClient{stub, model.LabelSet{"a": "1"}}, fmt.Errorf("")},
 				&AddLabelClient{stub, model.LabelSet{"a": "2"}},
-			}, model.Time(0), nil, 1),
+			}, model.Time(0), false, nil, 1, false),
 			labelNames:  []string{"a"},
 			labelValues: []model.LabelValue{"1", "2"},
 			v: model.Vector{
@@ -327,11 +383,11 @@ func TestMultiAPIMerging(t *testing.T) {
 		},
 		// multi with no labels
 		{
-			a: NewMultiAPI([]API{
+			a: NewMustMultiAPI([]API{
 				stub,
 				&AddLabelClient{stub, model.LabelSet{"a": "1"}},
 				&AddLabelClient{stub, model.LabelSet{"a": "2"}},
-			}, model.Time(0), nil, 1),
+			}, model.Time(0), false, nil, 1, false),
 			labelNames:  []string{"a"},
 			labelValues: []model.LabelValue{"1", "2"},
 			v: model.Vector{
@@ -402,7 +458,8 @@ func TestMultiAPIMerging(t *testing.T) {
 			})
 
 			t.Run("Query", func(t *testing.T) {
-				v, _, err := test.a.Query(context.TODO(), "testmetric", time.Now())
+				ss := test.a.Query(context.TODO(), "testmetric", time.Now())
+				err := ss.Err()
 				if err != nil != test.err {
 					if test.err {
 						t.Fatalf("missing expected err")
@@ -411,8 +468,8 @@ func TestMultiAPIMerging(t *testing.T) {
 					}
 				}
 				if err == nil {
-					if v.String() != test.v.String() {
-						t.Fatalf("mismatch in value: \nexpected=%s\nactual=%s", test.v.String(), v.String())
+					if got, want := ssDataStrings(ss), valueDataStrings(test.v); !slices.Equal(got, want) {
+						t.Fatalf("mismatch in value: \nexpected=%v\nactual=%v", want, got)
 					}
 				} else {
 					if test.v != nil {
@@ -422,7 +479,8 @@ func TestMultiAPIMerging(t *testing.T) {
 			})
 
 			t.Run("QueryRange", func(t *testing.T) {
-				v, _, err := test.a.QueryRange(context.TODO(), "testmetric", v1.Range{})
+				ss := test.a.QueryRange(context.TODO(), "testmetric", v1.Range{})
+				err := ss.Err()
 				if err != nil != test.err {
 					if test.err {
 						t.Fatalf("missing expected err")
@@ -431,8 +489,8 @@ func TestMultiAPIMerging(t *testing.T) {
 					}
 				}
 				if err == nil {
-					if v.String() != test.v.String() {
-						t.Fatalf("mismatch in value: \nexpected=%s\nactual=%s", test.v.String(), v.String())
+					if got, want := ssDataStrings(ss), valueDataStrings(test.v); !slices.Equal(got, want) {
+						t.Fatalf("mismatch in value: \nexpected=%v\nactual=%v", want, got)
 					}
 				} else {
 					if test.v != nil {
@@ -468,11 +526,12 @@ func TestMultiAPIMerging(t *testing.T) {
 			})
 
 			t.Run("GetValue", func(t *testing.T) {
-				v, _, err := test.a.GetValue(context.TODO(), time.Now(), time.Now(), []*labels.Matcher{{
+				ss := test.a.GetValue(context.TODO(), time.Now(), time.Now(), []*labels.Matcher{{
 					Type:  labels.MatchEqual,
 					Name:  "__name__",
 					Value: "testmetric",
 				}})
+				err := ss.Err()
 				if err != nil != test.err {
 					if test.err {
 						t.Fatalf("missing expected err")
@@ -481,8 +540,8 @@ func TestMultiAPIMerging(t *testing.T) {
 					}
 				}
 				if err == nil {
-					if v.String() != test.v.String() {
-						t.Fatalf("mismatch in value: \nexpected=%s\nactual=%s", test.v.String(), v.String())
+					if got, want := ssDataStrings(ss), valueDataStrings(test.v); !slices.Equal(got, want) {
+						t.Fatalf("mismatch in value: \nexpected=%v\nactual=%v", want, got)
 					}
 				} else {
 					if test.v != nil {
@@ -492,4 +551,737 @@ func TestMultiAPIMerging(t *testing.T) {
 			})
 		})
 	}
+}
+
+func ssDataStrings(ss storage.SeriesSet) []string {
+	var out []string
+	for ss.Next() {
+		s := ss.At()
+		var b strings.Builder
+		b.WriteString(s.Labels().String())
+		b.WriteString(" =>")
+		it := s.Iterator(nil)
+		for it.Next() != chunkenc.ValNone {
+			t, v := it.At()
+			fmt.Fprintf(&b, " %d=%g", t, v)
+		}
+		out = append(out, b.String())
+	}
+	sort.Strings(out)
+	return out
+}
+
+func metricToLabelsT(m model.Metric) labels.Labels {
+	b := labels.NewScratchBuilder(len(m))
+	for k, v := range m {
+		b.Add(string(k), string(v))
+	}
+	b.Sort()
+	return b.Labels()
+}
+
+func valueDataStrings(v model.Value) []string {
+	var out []string
+	switch tv := v.(type) {
+	case model.Vector:
+		for _, s := range tv {
+			out = append(out, fmt.Sprintf("%s => %d=%g", metricToLabelsT(s.Metric).String(), int64(s.Timestamp), float64(s.Value)))
+		}
+	case model.Matrix:
+		for _, ss := range tv {
+			var b strings.Builder
+			b.WriteString(metricToLabelsT(ss.Metric).String())
+			b.WriteString(" =>")
+			for _, p := range ss.Values {
+				fmt.Fprintf(&b, " %d=%g", int64(p.Timestamp), float64(p.Value))
+			}
+			out = append(out, b.String())
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestMultiAPIQueryExemplarsMerging(t *testing.T) {
+	mkResult := func(series model.LabelSet, traceID string, val float64, ts int64) v1.ExemplarQueryResult {
+		return v1.ExemplarQueryResult{
+			SeriesLabels: series,
+			Exemplars: []v1.Exemplar{
+				{Labels: model.LabelSet{"trace_id": model.LabelValue(traceID)}, Value: model.SampleValue(val), Timestamp: model.Time(ts)},
+			},
+		}
+	}
+
+	tests := []struct {
+		name          string
+		api           API
+		wantSeries    int // unique series in merged result
+		wantExemplars int // total exemplars across all series
+		wantErr       bool
+	}{
+		{
+			// Two server-groups, both returning the SAME series label set
+			// — exemplar lists must concatenate onto a single output entry.
+			name: "merge same series across groups",
+			api: NewMustMultiAPI([]API{
+				&stubAPI{queryExemplars: func() []v1.ExemplarQueryResult {
+					return []v1.ExemplarQueryResult{mkResult(model.LabelSet{"__name__": "foo"}, "a", 1, 100)}
+				}},
+				&stubAPI{queryExemplars: func() []v1.ExemplarQueryResult {
+					return []v1.ExemplarQueryResult{mkResult(model.LabelSet{"__name__": "foo"}, "b", 2, 200)}
+				}},
+			}, model.Time(0), false, nil, 1, false),
+			wantSeries:    1,
+			wantExemplars: 2,
+		},
+		{
+			// Different series in each group — both must appear.
+			name: "different series across groups",
+			api: NewMustMultiAPI([]API{
+				&stubAPI{queryExemplars: func() []v1.ExemplarQueryResult {
+					return []v1.ExemplarQueryResult{mkResult(model.LabelSet{"__name__": "foo"}, "a", 1, 100)}
+				}},
+				&stubAPI{queryExemplars: func() []v1.ExemplarQueryResult {
+					return []v1.ExemplarQueryResult{mkResult(model.LabelSet{"__name__": "bar"}, "b", 2, 200)}
+				}},
+			}, model.Time(0), false, nil, 1, false),
+			wantSeries:    2,
+			wantExemplars: 2,
+		},
+		{
+			// requiredCount=1, one error / one success → quorum met → success.
+			name: "tolerates one error when requiredCount=1",
+			api: NewMustMultiAPI([]API{
+				&errorAPI{API: &stubAPI{}, err: fmt.Errorf("boom")},
+				&stubAPI{queryExemplars: func() []v1.ExemplarQueryResult {
+					return []v1.ExemplarQueryResult{mkResult(model.LabelSet{"__name__": "foo"}, "a", 1, 100)}
+				}},
+			}, model.Time(0), false, nil, 1, false),
+			wantSeries:    1,
+			wantExemplars: 1,
+		},
+		{
+			// requiredCount=2, only one stub is healthy → quorum fails.
+			name: "errors when quorum unmet",
+			api: NewMustMultiAPI([]API{
+				&errorAPI{API: &stubAPI{}, err: fmt.Errorf("boom")},
+				&stubAPI{queryExemplars: func() []v1.ExemplarQueryResult {
+					return []v1.ExemplarQueryResult{mkResult(model.LabelSet{"__name__": "foo"}, "a", 1, 100)}
+				}},
+			}, model.Time(0), false, nil, 2, false),
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.api.QueryExemplars(context.Background(), `foo`, time.Unix(0, 0), time.Unix(1, 0))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %d series", len(got))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != tc.wantSeries {
+				t.Fatalf("series count: want=%d got=%d (%+v)", tc.wantSeries, len(got), got)
+			}
+			total := 0
+			for _, qr := range got {
+				total += len(qr.Exemplars)
+			}
+			if total != tc.wantExemplars {
+				t.Fatalf("exemplar count: want=%d got=%d (%+v)", tc.wantExemplars, total, got)
+			}
+		})
+	}
+}
+
+func TestMultiAPIQueryExemplarsDedup(t *testing.T) {
+	ex := func(traceID string, val float64, ts int64) v1.Exemplar {
+		e := v1.Exemplar{Value: model.SampleValue(val), Timestamp: model.Time(ts)}
+		if traceID != "" {
+			e.Labels = model.LabelSet{"trace_id": model.LabelValue(traceID)}
+		}
+		return e
+	}
+	result := func(series model.LabelSet, exemplars ...v1.Exemplar) v1.ExemplarQueryResult {
+		return v1.ExemplarQueryResult{SeriesLabels: series, Exemplars: exemplars}
+	}
+	stub := func(results ...v1.ExemplarQueryResult) API {
+		return &stubAPI{queryExemplars: func() []v1.ExemplarQueryResult { return results }}
+	}
+	foo := model.LabelSet{"__name__": "foo"}
+	bar := model.LabelSet{"__name__": "bar"}
+
+	tests := []struct {
+		name string
+		apis []API
+		want []v1.ExemplarQueryResult
+	}{
+		{
+			// HA replicas of the same prometheus observed the same exemplar;
+			// it must be returned exactly once.
+			name: "identical exemplar from two replicas is deduplicated",
+			apis: []API{
+				stub(result(foo, ex("a", 1, 100))),
+				stub(result(foo, ex("a", 1, 100))),
+			},
+			want: []v1.ExemplarQueryResult{result(foo, ex("a", 1, 100))},
+		},
+		{
+			// Same timestamp, different trace IDs -- legitimately distinct
+			// exemplars, both must be kept.
+			name: "same timestamp with different labels are both kept",
+			apis: []API{
+				stub(result(foo, ex("a", 1, 100))),
+				stub(result(foo, ex("b", 1, 100))),
+			},
+			want: []v1.ExemplarQueryResult{result(foo, ex("a", 1, 100), ex("b", 1, 100))},
+		},
+		{
+			// Same timestamp and labels but a different value is a distinct exemplar.
+			name: "same timestamp and labels with different values are both kept",
+			apis: []API{
+				stub(result(foo, ex("a", 1, 100))),
+				stub(result(foo, ex("a", 2, 100))),
+			},
+			want: []v1.ExemplarQueryResult{result(foo, ex("a", 1, 100), ex("a", 2, 100))},
+		},
+		{
+			name: "exemplars are sorted by timestamp",
+			apis: []API{
+				stub(result(foo, ex("c", 3, 300), ex("a", 1, 100))),
+				stub(result(foo, ex("d", 4, 400), ex("b", 2, 200))),
+			},
+			want: []v1.ExemplarQueryResult{
+				result(foo, ex("a", 1, 100), ex("b", 2, 200), ex("c", 3, 300), ex("d", 4, 400)),
+			},
+		},
+		{
+			name: "different series stay separate and are sorted by series labels",
+			apis: []API{
+				stub(result(foo, ex("a", 1, 100)), result(bar, ex("b", 2, 200))),
+				stub(result(foo, ex("a", 1, 100)), result(bar, ex("b", 2, 200))),
+			},
+			want: []v1.ExemplarQueryResult{
+				result(bar, ex("b", 2, 200)),
+				result(foo, ex("a", 1, 100)),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			api := NewMustMultiAPI(tc.apis, model.Time(0), false, nil, 1, false)
+			got, err := api.QueryExemplars(context.Background(), `foo`, time.Unix(0, 0), time.Unix(1, 0))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("result mismatch\nwant: %+v\ngot:  %+v", tc.want, got)
+			}
+		})
+	}
+}
+
+// Metadata returns metadata about metrics currently scraped by the metric name.
+func (s *errorAPI) Metadata(ctx context.Context, metric, limit string) (map[string][]v1.Metadata, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.API.Metadata(ctx, metric, limit)
+}
+
+// blockingAPI blocks every call until release is closed (or the context is
+// cancelled). It's used to prove that the MultiAPI fan-out consumes results in
+// completion order rather than in index order.
+type blockingAPI struct {
+	API
+	release <-chan struct{}
+}
+
+func (s *blockingAPI) Key() model.LabelSet {
+	if apiLabels, ok := s.API.(APILabels); ok {
+		return apiLabels.Key()
+	}
+	return nil
+}
+
+func (s *blockingAPI) wait(ctx context.Context) error {
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *blockingAPI) LabelNames(ctx context.Context, matchers []string, startTime time.Time, endTime time.Time) ([]string, v1.Warnings, error) {
+	if err := s.wait(ctx); err != nil {
+		return nil, nil, err
+	}
+	return s.API.LabelNames(ctx, matchers, startTime, endTime)
+}
+
+func (s *blockingAPI) LabelValues(ctx context.Context, label string, matchers []string, startTime time.Time, endTime time.Time) (model.LabelValues, v1.Warnings, error) {
+	if err := s.wait(ctx); err != nil {
+		return nil, nil, err
+	}
+	return s.API.LabelValues(ctx, label, matchers, startTime, endTime)
+}
+
+func (s *blockingAPI) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
+	if err := s.wait(ctx); err != nil {
+		return storage.ErrSeriesSet(err)
+	}
+	return s.API.Query(ctx, query, ts)
+}
+
+func (s *blockingAPI) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
+	if err := s.wait(ctx); err != nil {
+		return storage.ErrSeriesSet(err)
+	}
+	return s.API.QueryRange(ctx, query, r)
+}
+
+func (s *blockingAPI) Series(ctx context.Context, matches []string, startTime time.Time, endTime time.Time) ([]model.LabelSet, v1.Warnings, error) {
+	if err := s.wait(ctx); err != nil {
+		return nil, nil, err
+	}
+	return s.API.Series(ctx, matches, startTime, endTime)
+}
+
+func (s *blockingAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
+	if err := s.wait(ctx); err != nil {
+		return storage.ErrSeriesSet(err)
+	}
+	return s.API.GetValue(ctx, start, end, matchers)
+}
+
+func (s *blockingAPI) Metadata(ctx context.Context, metric, limit string) (map[string][]v1.Metadata, error) {
+	if err := s.wait(ctx); err != nil {
+		return nil, err
+	}
+	return s.API.Metadata(ctx, metric, limit)
+}
+
+func (s *blockingAPI) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
+	if err := s.wait(ctx); err != nil {
+		return nil, err
+	}
+	return s.API.QueryExemplars(ctx, query, startTime, endTime)
+}
+
+// TestMultiAPIEarlyReturnOnLaterIndexFailure asserts that a fatal failure from
+// a later-indexed API aborts the fan-out immediately, instead of waiting for a
+// slow earlier-indexed API to finish first. Index 0 blocks for the whole
+// duration of the call (it is only released on the way out of the subtest) and
+// index 1 fails right away; with requiredCount=2 that single failure makes the
+// result impossible to assemble, so every method must return promptly.
+func TestMultiAPIEarlyReturnOnLaterIndexFailure(t *testing.T) {
+	const timeout = 10 * time.Second
+
+	run := func(t *testing.T, call func(api *MultiAPI) error) {
+		t.Helper()
+
+		release := make(chan struct{})
+		// The blocked index-0 goroutine is only ever released here, so it
+		// cannot leak past the subtest -- and the call under test must have
+		// returned before this runs.
+		defer close(release)
+
+		// Neither API has a Key(), so both land in a single fingerprint
+		// bucket; requiredCount=2 makes one error fatal for that bucket.
+		api := NewMustMultiAPI([]API{
+			&blockingAPI{API: &stubAPI{}, release: release},
+			&errorAPI{API: &stubAPI{}, err: fmt.Errorf("boom")},
+		}, model.Time(0), false, nil, 2, false)
+
+		done := make(chan error, 1)
+		go func() { done <- call(api) }()
+
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("expected an error from the failing index-1 API, got nil")
+			}
+		case <-time.After(timeout):
+			t.Fatalf("call did not return within %s: it is waiting on the slow index-0 API instead of consuming results as they arrive", timeout)
+		}
+	}
+
+	t.Run("LabelValues", func(t *testing.T) {
+		run(t, func(api *MultiAPI) error {
+			_, _, err := api.LabelValues(context.Background(), "a", nil, time.Time{}, time.Time{})
+			return err
+		})
+	})
+
+	t.Run("LabelNames", func(t *testing.T) {
+		run(t, func(api *MultiAPI) error {
+			_, _, err := api.LabelNames(context.Background(), nil, time.Time{}, time.Time{})
+			return err
+		})
+	})
+
+	t.Run("Query", func(t *testing.T) {
+		run(t, func(api *MultiAPI) error {
+			return api.Query(context.Background(), "testmetric", time.Now()).Err()
+		})
+	})
+
+	t.Run("QueryRange", func(t *testing.T) {
+		run(t, func(api *MultiAPI) error {
+			return api.QueryRange(context.Background(), "testmetric", v1.Range{}).Err()
+		})
+	})
+
+	t.Run("GetValue", func(t *testing.T) {
+		run(t, func(api *MultiAPI) error {
+			return api.GetValue(context.Background(), time.Now(), time.Now(), nil).Err()
+		})
+	})
+
+	t.Run("Series", func(t *testing.T) {
+		run(t, func(api *MultiAPI) error {
+			_, _, err := api.Series(context.Background(), []string{"testmetric"}, time.Now(), time.Now())
+			return err
+		})
+	})
+
+	t.Run("Metadata", func(t *testing.T) {
+		run(t, func(api *MultiAPI) error {
+			_, err := api.Metadata(context.Background(), "testmetric", "")
+			return err
+		})
+	})
+
+	t.Run("QueryExemplars", func(t *testing.T) {
+		run(t, func(api *MultiAPI) error {
+			_, err := api.QueryExemplars(context.Background(), "testmetric", time.Unix(0, 0), time.Unix(1, 0))
+			return err
+		})
+	})
+}
+
+// TestMultiAPIMergeIndependentOfCompletionOrder asserts that consuming results
+// out of index order doesn't change the merged output: index 0 is held back so
+// index 1's result lands first, and the merged result must match the merge of
+// the same two APIs completing in index order.
+func TestMultiAPIMergeIndependentOfCompletionOrder(t *testing.T) {
+	const timeout = 10 * time.Second
+
+	getSample := func(ls model.LabelSet) *model.Sample {
+		return &model.Sample{
+			Metric:    model.Metric(ls),
+			Value:     model.SampleValue(1),
+			Timestamp: model.Time(100),
+		}
+	}
+	mkStub := func(v model.LabelValue) API {
+		return &AddLabelClient{&stubAPI{
+			labelNames:  func() []string { return []string{"a"} },
+			labelValues: func(_ string) model.LabelValues { return model.LabelValues{} },
+			query: func() model.Value {
+				return model.Vector{getSample(model.LabelSet{model.MetricNameLabel: "testmetric"})}
+			},
+			queryRange: func(_ string, _ v1.Range) model.Value {
+				return model.Vector{getSample(model.LabelSet{model.MetricNameLabel: "testmetric"})}
+			},
+			series: func() []model.LabelSet {
+				return []model.LabelSet{{model.MetricNameLabel: "testmetric"}}
+			},
+			getValue: func() model.Value {
+				return model.Vector{getSample(model.LabelSet{model.MetricNameLabel: "testmetric"})}
+			},
+		}, model.LabelSet{"a": v}}
+	}
+
+	run := func(t *testing.T, call func(api *MultiAPI) any) {
+		t.Helper()
+
+		// Baseline: both APIs complete in index order.
+		want := call(NewMustMultiAPI([]API{mkStub("1"), mkStub("2")}, model.Time(0), false, nil, 1, false))
+
+		release := make(chan struct{})
+		var once sync.Once
+		releaseFn := func() { once.Do(func() { close(release) }) }
+		defer releaseFn()
+
+		delayed := NewMustMultiAPI([]API{
+			&blockingAPI{API: mkStub("1"), release: release},
+			mkStub("2"),
+		}, model.Time(0), false, nil, 1, false)
+
+		done := make(chan any, 1)
+		go func() { done <- call(delayed) }()
+
+		// Let index 1's result land in the shared channel first, then let
+		// index 0 proceed.
+		time.Sleep(50 * time.Millisecond)
+		releaseFn()
+
+		select {
+		case got := <-done:
+			if !reflect.DeepEqual(want, got) {
+				t.Fatalf("out-of-order merge differs from in-order merge\nin-order    =%#v\nout-of-order=%#v", want, got)
+			}
+		case <-time.After(timeout):
+			t.Fatalf("call did not return within %s", timeout)
+		}
+	}
+
+	t.Run("LabelValues", func(t *testing.T) {
+		run(t, func(api *MultiAPI) any {
+			v, _, err := api.LabelValues(context.Background(), "a", nil, time.Time{}, time.Time{})
+			if err != nil {
+				return err.Error()
+			}
+			return v
+		})
+	})
+
+	t.Run("LabelNames", func(t *testing.T) {
+		run(t, func(api *MultiAPI) any {
+			v, _, err := api.LabelNames(context.Background(), nil, time.Time{}, time.Time{})
+			if err != nil {
+				return err.Error()
+			}
+			return v
+		})
+	})
+
+	t.Run("Query", func(t *testing.T) {
+		run(t, func(api *MultiAPI) any {
+			return ssDataStrings(api.Query(context.Background(), "testmetric", time.Now()))
+		})
+	})
+
+	t.Run("QueryRange", func(t *testing.T) {
+		run(t, func(api *MultiAPI) any {
+			return ssDataStrings(api.QueryRange(context.Background(), "testmetric", v1.Range{}))
+		})
+	})
+
+	t.Run("GetValue", func(t *testing.T) {
+		run(t, func(api *MultiAPI) any {
+			return ssDataStrings(api.GetValue(context.Background(), time.Now(), time.Now(), []*labels.Matcher{{
+				Type:  labels.MatchEqual,
+				Name:  "__name__",
+				Value: "testmetric",
+			}}))
+		})
+	})
+
+	t.Run("Series", func(t *testing.T) {
+		run(t, func(api *MultiAPI) any {
+			v, _, err := api.Series(context.Background(), []string{"testmetric"}, time.Now(), time.Now())
+			if err != nil {
+				return err.Error()
+			}
+			return v
+		})
+	})
+}
+
+// errClass names the API status class an error maps to, mirroring the
+// vendored API's returnAPIError.
+func errClass(err error) string {
+	switch errorRank(err) {
+	case rankCanceled:
+		return "canceled"
+	case rankStorage:
+		return "storage"
+	case rankTimeout:
+		return "timeout"
+	}
+	return "refused"
+}
+
+func TestNormalizePromError(t *testing.T) {
+	tests := []struct {
+		name  string
+		in    error
+		want  string // the normalized error's message
+		class string
+	}{
+		{
+			name: "v1_json_timeout_body",
+			in:   &v1.Error{Type: v1.ErrServer, Msg: "server error: 503", Detail: `{"status":"error","errorType":"timeout","error":"query timed out in expression evaluation"}`},
+			want: "query timed out in expression evaluation", class: "timeout",
+		},
+		{
+			name: "v1_json_canceled_body",
+			in:   &v1.Error{Type: v1.ErrServer, Msg: "server error: 503", Detail: `{"status":"error","errorType":"canceled","error":"query was canceled in expression evaluation"}`},
+			want: "query was canceled in expression evaluation", class: "canceled",
+		},
+		{
+			name: "v1_json_internal_body",
+			in:   &v1.Error{Type: v1.ErrServer, Msg: "server error: 500", Detail: `{"status":"error","errorType":"internal","error":"boom"}`},
+			want: "server_error: server error: 500: internal: boom", class: "storage",
+		},
+		{
+			name: "v1_json_execution_body",
+			in:   &v1.Error{Type: v1.ErrServer, Msg: "server error: 503", Detail: `{"status":"error","errorType":"execution","error":"boom"}`},
+			want: "server_error: server error: 503: execution: boom", class: "refused",
+		},
+		{
+			name: "v1_plain_text_body",
+			in:   &v1.Error{Type: v1.ErrServer, Msg: "server error: 503", Detail: "too many outstanding requests\n"},
+			want: "server_error: server error: 503: too many outstanding requests", class: "storage",
+		},
+		{
+			name: "v1_429_no_body",
+			in:   &v1.Error{Type: v1.ErrClient, Msg: "client error: 429"},
+			want: "client_error: client error: 429", class: "storage",
+		},
+		{
+			name: "v1_bad_response",
+			in:   &v1.Error{Type: v1.ErrBadResponse, Msg: "invalid character 'x'"},
+			want: "bad_response: invalid character 'x'", class: "storage",
+		},
+		{
+			name: "v1_execution",
+			in:   &v1.Error{Type: v1.ErrExec, Msg: "boom"},
+			want: "execution: boom", class: "refused",
+		},
+		{
+			name: "v1_bad_data",
+			in:   &v1.Error{Type: v1.ErrBadData, Msg: "parse error"},
+			want: "bad_data: parse error", class: "refused",
+		},
+		{
+			name: "promapi_timeout",
+			in:   &promapi.ResponseError{Type: "timeout", Msg: "query timed out in expression evaluation"},
+			want: "query timed out in expression evaluation", class: "timeout",
+		},
+		{
+			name: "promapi_canceled",
+			in:   &promapi.ResponseError{Type: "canceled", Msg: "query was canceled in expression evaluation"},
+			want: "query was canceled in expression evaluation", class: "canceled",
+		},
+		{
+			name: "promapi_unavailable",
+			in:   &promapi.ResponseError{Type: "unavailable", Msg: "TSDB not ready"},
+			want: "unavailable: TSDB not ready", class: "storage",
+		},
+		{
+			name: "promapi_execution",
+			in:   &promapi.ResponseError{Type: "execution", Msg: "boom"},
+			want: "execution: boom", class: "refused",
+		},
+		{
+			name: "promapi_bad_response",
+			in:   &promapi.ResponseError{Type: "bad_response", Msg: "ReadObject: ..."},
+			want: "bad_response: ReadObject: ...", class: "storage",
+		},
+		{
+			name: "promapi_http_error",
+			in:   &promapi.HTTPError{StatusCode: 429, Body: "slow down"},
+			want: "server returned HTTP status 429 Too Many Requests: slow down", class: "storage",
+		},
+		{
+			name: "connection_refused",
+			in:   &url.Error{Op: "Post", URL: "http://x", Err: errors.New("dial tcp: connection refused")},
+			want: `Post "http://x": dial tcp: connection refused`, class: "storage",
+		},
+		{
+			name: "transport_timeout",
+			in:   &url.Error{Op: "Post", URL: "http://x", Err: timeoutErr{}},
+			want: `query timed out in Post "http://x": timeout awaiting response headers`, class: "timeout",
+		},
+		{
+			name: "deadline_exceeded",
+			in:   &url.Error{Op: "Post", URL: "http://x", Err: context.DeadlineExceeded},
+			want: `query timed out in Post "http://x": context deadline exceeded`, class: "timeout",
+		},
+		{
+			// The request's own context: the client went away.
+			name: "context_canceled",
+			in:   &url.Error{Op: "Post", URL: "http://x", Err: context.Canceled},
+			want: `Post "http://x": context canceled`, class: "canceled",
+		},
+		{
+			name: "unknown",
+			in:   errors.New("promxy refused this itself"),
+			want: "promxy refused this itself", class: "refused",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := NormalizePromError(tc.in)
+			if got.Error() != tc.want {
+				t.Errorf("got %q, want %q", got.Error(), tc.want)
+			}
+			if c := errClass(got); c != tc.class {
+				t.Errorf("%T classified %s, want %s", got, c, tc.class)
+			}
+			// Normalizing is idempotent, including through ErrorWrap's context.
+			wrapped := (&ErrorWrap{Msg: "error in target=x"}).wrap(got)
+			if again := NormalizePromError(wrapped); again != wrapped {
+				t.Errorf("normalizing again changed %v to %v", wrapped, again)
+			}
+		})
+	}
+
+	if NormalizePromError(nil) != nil {
+		t.Error("nil did not stay nil")
+	}
+}
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "timeout awaiting response headers" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+func TestErrorPicker(t *testing.T) {
+	var (
+		refused  = errors.New("execution: boom")
+		timeout  = promql.ErrQueryTimeout("x")
+		storage  = promql.ErrStorage{Err: errors.New("connection refused")}
+		canceled = context.Canceled
+		storage2 = promql.ErrStorage{Err: errors.New("503")}
+	)
+	tests := []struct {
+		name string
+		errs []error // in arrival order; each one's API index is its position
+		want error
+	}{
+		{"refused_beats_all", []error{canceled, storage, timeout, refused}, refused},
+		{"timeout_beats_storage", []error{storage, timeout}, timeout},
+		{"storage_beats_canceled", []error{canceled, storage}, storage},
+		{"tie_goes_to_lowest_index", []error{storage, storage2}, storage},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// The pick must not depend on arrival order.
+			for _, order := range [][]int{ascending(len(tc.errs)), descending(len(tc.errs))} {
+				var p errorPicker
+				for _, i := range order {
+					p.add(i, tc.errs[i])
+				}
+				if p.err != tc.want {
+					t.Errorf("arrival order %v: got %v, want %v", order, p.err, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func ascending(n int) []int {
+	o := make([]int, n)
+	for i := range o {
+		o[i] = i
+	}
+	return o
+}
+
+func descending(n int) []int {
+	o := ascending(n)
+	slices.Reverse(o)
+	return o
 }

@@ -106,6 +106,15 @@ func (r *ApacheLogRecord) WriteHeader(status int) {
 	r.ResponseWriter.WriteHeader(status)
 }
 
+// Flush forwards to the wrapped ResponseWriter when it supports flushing.
+// Without this, streaming handlers (e.g. the notifications SSE endpoint) see
+// the wrapper as a non-Flusher and bail out with "Streaming unsupported".
+func (r *ApacheLogRecord) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 type LogRecordHandler func(*ApacheLogRecord)
 
 func LogToWriter(out io.Writer) LogRecordHandler {
@@ -136,7 +145,7 @@ func (h *ApacheLoggingHandler) runHandler(rw http.ResponseWriter, r *http.Reques
 	defer func() {
 		if rec := recover(); rec != nil {
 			// Just return a stack trace always
-			err = errors.Wrap(fmt.Errorf(string(debug.Stack())), "Error running handler")
+			err = errors.Wrap(errors.New(string(debug.Stack())), "Error running handler")
 		}
 	}()
 	h.handler.ServeHTTP(rw, r)

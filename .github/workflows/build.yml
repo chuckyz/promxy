@@ -11,22 +11,28 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: azure/docker-login@v1
+      - uses: actions/checkout@v4
+      - uses: azure/docker-login@v2
         with:
           login-server: quay.io
           username: '${{ secrets.QUAYIO_USERNAME }}'
           password: '${{ secrets.QUAYIO_PASSWORD }}'
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         id: buildx
-        uses: crazy-max/ghaction-docker-buildx@v1
-        with:
-          buildx-version: latest
-          qemu-version: latest
+        uses: docker/setup-buildx-action@v3
       - name: Available platforms
         run: 'echo ${{ steps.buildx.outputs.platforms }}'
       - name: Run Buildx
-        run: |
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            --push -t quay.io/jacksontj/promxy:${GITHUB_REF##*/} .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/386,linux/arm/v7,linux/arm64
+          push: true
+          tags: quay.io/jacksontj/promxy:${{ github.ref_name == 'master' && 'latest' || github.ref_name }}
+          # Reuse the Go build cache (and image layers) across runs. Combined with
+          # the cache mounts in the Dockerfile this avoids recompiling promxy +
+          # vendor from scratch for all four platforms on every push.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

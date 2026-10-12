@@ -16,7 +16,6 @@ package main
 import (
 	"bufio"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"strconv"
@@ -32,7 +31,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	dto "github.com/prometheus/client_model/go"
-	"github.com/prometheus/prometheus/pkg/value"
+	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/prompb"
 )
 
@@ -76,7 +75,7 @@ func main() {
 	}()
 
 	http.HandleFunc(opts.WritePath, func(w http.ResponseWriter, r *http.Request) {
-		compressed, err := ioutil.ReadAll(r.Body)
+		compressed, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -126,7 +125,7 @@ func main() {
 	})
 
 	http.HandleFunc(opts.WriteTextPath, func(w http.ResponseWriter, r *http.Request) {
-		decoder := expfmt.NewDecoder(r.Body, expfmt.FmtText) // TODO: get content-type header instead
+		decoder := expfmt.NewDecoder(r.Body, expfmt.NewFormat(expfmt.TypeTextPlain)) // TODO: get content-type header instead
 		for {
 			var mf dto.MetricFamily
 			err := decoder.Decode(&mf)

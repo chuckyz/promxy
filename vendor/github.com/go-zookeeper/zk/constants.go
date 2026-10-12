@@ -7,7 +7,7 @@ import (
 
 const (
 	protocolVersion = 0
-
+	// DefaultPort is the default port listened by server.
 	DefaultPort = 2181
 )
 
@@ -38,11 +38,13 @@ const (
 )
 
 const (
+	// EventNodeCreated represents a node is created.
 	EventNodeCreated         EventType = 1
 	EventNodeDeleted         EventType = 2
 	EventNodeDataChanged     EventType = 3
 	EventNodeChildrenChanged EventType = 4
 
+	// EventSession represents a session event.
 	EventSession     EventType = -1
 	EventNotWatching EventType = -2
 )
@@ -59,9 +61,11 @@ var (
 )
 
 const (
+	// StateUnknown means the session state is unknown.
 	StateUnknown           State = -1
 	StateDisconnected      State = 0
 	StateConnecting        State = 1
+	StateSyncConnected     State = 3
 	StateAuthFailed        State = 4
 	StateConnectedReadOnly State = 5
 	StateSaslAuthenticated State = 6
@@ -69,12 +73,6 @@ const (
 
 	StateConnected  = State(100)
 	StateHasSession = State(101)
-)
-
-const (
-	FlagEphemeral = 1
-	FlagSequence  = 2
-	FlagTTL       = 4
 )
 
 var (
@@ -88,11 +86,14 @@ var (
 		StateConnecting:        "StateConnecting",
 		StateConnected:         "StateConnected",
 		StateHasSession:        "StateHasSession",
+		StateSyncConnected:     "StateSyncConnected",
 	}
 )
 
+// State is the session state.
 type State int32
 
+// String converts State to a readable string.
 func (s State) String() string {
 	if name := stateNames[s]; name != "" {
 		return name
@@ -100,9 +101,11 @@ func (s State) String() string {
 	return "Unknown"
 }
 
+// ErrCode is the error code defined by server. Refer to ZK documentations for more specifics.
 type ErrCode int32
 
 var (
+	// ErrConnectionClosed means the connection has been closed.
 	ErrConnectionClosed        = errors.New("zk: connection closed")
 	ErrUnknown                 = errors.New("zk: unknown error")
 	ErrAPIError                = errors.New("zk: api error")
@@ -117,7 +120,7 @@ var (
 	ErrInvalidFlags            = errors.New("zk: invalid flags specified")
 	ErrAuthFailed              = errors.New("zk: client authentication failed")
 	ErrClosing                 = errors.New("zk: zookeeper is closing")
-	ErrNothing                 = errors.New("zk: no server responsees to process")
+	ErrNothing                 = errors.New("zk: no server responses to process")
 	ErrSessionMoved            = errors.New("zk: session moved to another server, so operation is ignored")
 	ErrReconfigDisabled        = errors.New("attempts to perform a reconfiguration operation when reconfiguration feature is disabled")
 	ErrBadArguments            = errors.New("invalid arguments")
@@ -184,6 +187,7 @@ const (
 
 // Constants for ACL permissions
 const (
+	// PermRead represents the permission needed to read a znode.
 	PermRead = 1 << iota
 	PermWrite
 	PermCreate
@@ -220,6 +224,7 @@ var (
 	}
 )
 
+// EventType represents the event type sent by server.
 type EventType int32
 
 func (t EventType) String() string {

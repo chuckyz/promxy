@@ -6,8 +6,25 @@ import (
 
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
 )
+
+// truncateWindow clamps the requested [start, end] range to the server group's
+// configured window [winStart, winEnd]. A zero winStart or winEnd means that
+// edge is unbounded and the caller's bound is left alone.
+//
+// Truncation may only ever narrow: a request that already sits inside the
+// window is passed through untouched.
+func truncateWindow(start, end, winStart, winEnd time.Time) (time.Time, time.Time) {
+	if !winStart.IsZero() && start.Before(winStart) {
+		start = winStart
+	}
+	if !winEnd.IsZero() && end.After(winEnd) {
+		end = winEnd
+	}
+	return start, end
+}
 
 // AbsoluteTimeFilter will filter queries out (return nil,nil) for all queries outside the given times
 type AbsoluteTimeFilter struct {
@@ -16,26 +33,57 @@ type AbsoluteTimeFilter struct {
 	Truncate   bool
 }
 
-// Query performs a query for the given time.
-func (tf *AbsoluteTimeFilter) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
-	if (!tf.Start.IsZero() && ts.Before(tf.Start)) || (!tf.End.IsZero() && ts.After(tf.End)) {
+// LabelNames returns all the unique label names present in the block in sorted order.
+func (tf *AbsoluteTimeFilter) LabelNames(ctx context.Context, matchers []string, startTime time.Time, endTime time.Time) ([]string, v1.Warnings, error) {
+	if (!tf.Start.IsZero() && endTime.Before(tf.Start)) || (!tf.End.IsZero() && startTime.After(tf.End)) {
 		return nil, nil, nil
+	}
+
+	if tf.Truncate {
+		startTime, endTime = truncateWindow(startTime, endTime, tf.Start, tf.End)
+	}
+
+	return tf.API.LabelNames(ctx, matchers, startTime, endTime)
+}
+
+// LabelValues performs a query for the values of the given label.
+func (tf *AbsoluteTimeFilter) LabelValues(ctx context.Context, label string, matchers []string, startTime time.Time, endTime time.Time) (model.LabelValues, v1.Warnings, error) {
+	if (!tf.Start.IsZero() && endTime.Before(tf.Start)) || (!tf.End.IsZero() && startTime.After(tf.End)) {
+		return nil, nil, nil
+	}
+
+	if tf.Truncate {
+		startTime, endTime = truncateWindow(startTime, endTime, tf.Start, tf.End)
+	}
+
+	return tf.API.LabelValues(ctx, label, matchers, startTime, endTime)
+}
+
+// Query performs a query for the given time.
+func (tf *AbsoluteTimeFilter) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
+	if (!tf.Start.IsZero() && ts.Before(tf.Start)) || (!tf.End.IsZero() && ts.After(tf.End)) {
+		return storage.EmptySeriesSet()
 	}
 
 	return tf.API.Query(ctx, query, ts)
 }
 
 // QueryRange performs a query for the given range.
-func (tf *AbsoluteTimeFilter) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
+func (tf *AbsoluteTimeFilter) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
 	if (!tf.Start.IsZero() && r.End.Before(tf.Start)) || (!tf.End.IsZero() && r.Start.After(tf.End)) {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	if tf.Truncate {
-		if r.Start.Before(tf.Start) {
-			r.Start = tf.Start
+		if !tf.Start.IsZero() && r.Start.Before(tf.Start) {
+			remainder := tf.Start.Sub(r.Start) % r.Step
+			if remainder > 0 {
+				r.Start = tf.Start.Add(r.Step - remainder)
+			} else {
+				r.Start = tf.Start
+			}
 		}
-		if r.End.After(tf.End) {
+		if !tf.End.IsZero() && r.End.After(tf.End) {
 			r.End = tf.End
 		}
 	}
@@ -50,33 +98,36 @@ func (tf *AbsoluteTimeFilter) Series(ctx context.Context, matches []string, star
 	}
 
 	if tf.Truncate {
-		if startTime.Before(tf.Start) {
-			startTime = tf.Start
-		}
-		if endTime.After(tf.End) {
-			endTime = tf.End
-		}
+		startTime, endTime = truncateWindow(startTime, endTime, tf.Start, tf.End)
 	}
 
 	return tf.API.Series(ctx, matches, startTime, endTime)
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (tf *AbsoluteTimeFilter) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
+func (tf *AbsoluteTimeFilter) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
 	if (!tf.Start.IsZero() && end.Before(tf.Start)) || (!tf.End.IsZero() && start.After(tf.End)) {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	if tf.Truncate {
-		if start.Before(tf.Start) {
-			start = tf.Start
-		}
-		if end.After(tf.End) {
-			end = tf.End
-		}
+		start, end = truncateWindow(start, end, tf.Start, tf.End)
 	}
 
 	return tf.API.GetValue(ctx, start, end, matchers)
+}
+
+// QueryExemplars performs a query for exemplars by the given query and time range.
+func (tf *AbsoluteTimeFilter) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
+	if (!tf.Start.IsZero() && endTime.Before(tf.Start)) || (!tf.End.IsZero() && startTime.After(tf.End)) {
+		return nil, nil
+	}
+
+	if tf.Truncate {
+		startTime, endTime = truncateWindow(startTime, endTime, tf.Start, tf.End)
+	}
+
+	return tf.API.QueryExemplars(ctx, query, startTime, endTime)
 }
 
 // RelativeTimeFilter will filter queries out (return nil,nil) for all queries outside the given durations relative to time.Now()
@@ -100,28 +151,61 @@ func (tf *RelativeTimeFilter) window() (time.Time, time.Time) {
 	return start, end
 }
 
+// LabelNames returns all the unique label names present in the block in sorted order.
+func (tf *RelativeTimeFilter) LabelNames(ctx context.Context, matchers []string, startTime time.Time, endTime time.Time) ([]string, v1.Warnings, error) {
+	tfStart, tfEnd := tf.window()
+	if (!tfStart.IsZero() && endTime.Before(tfStart)) || (!tfEnd.IsZero() && startTime.After(tfEnd)) {
+		return nil, nil, nil
+	}
+
+	if tf.Truncate {
+		startTime, endTime = truncateWindow(startTime, endTime, tfStart, tfEnd)
+	}
+
+	return tf.API.LabelNames(ctx, matchers, startTime, endTime)
+}
+
+// LabelValues performs a query for the values of the given label.
+func (tf *RelativeTimeFilter) LabelValues(ctx context.Context, label string, matchers []string, startTime time.Time, endTime time.Time) (model.LabelValues, v1.Warnings, error) {
+	tfStart, tfEnd := tf.window()
+	if (!tfStart.IsZero() && endTime.Before(tfStart)) || (!tfEnd.IsZero() && startTime.After(tfEnd)) {
+		return nil, nil, nil
+	}
+
+	if tf.Truncate {
+		startTime, endTime = truncateWindow(startTime, endTime, tfStart, tfEnd)
+	}
+
+	return tf.API.LabelValues(ctx, label, matchers, startTime, endTime)
+}
+
 // Query performs a query for the given time.
-func (tf *RelativeTimeFilter) Query(ctx context.Context, query string, ts time.Time) (model.Value, v1.Warnings, error) {
+func (tf *RelativeTimeFilter) Query(ctx context.Context, query string, ts time.Time) storage.SeriesSet {
 	tfStart, tfEnd := tf.window()
 	if (!tfStart.IsZero() && ts.Before(tfStart)) || (!tfEnd.IsZero() && ts.After(tfEnd)) {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	return tf.API.Query(ctx, query, ts)
 }
 
 // QueryRange performs a query for the given range.
-func (tf *RelativeTimeFilter) QueryRange(ctx context.Context, query string, r v1.Range) (model.Value, v1.Warnings, error) {
+func (tf *RelativeTimeFilter) QueryRange(ctx context.Context, query string, r v1.Range) storage.SeriesSet {
 	tfStart, tfEnd := tf.window()
 	if (!tfStart.IsZero() && r.End.Before(tfStart)) || (!tfEnd.IsZero() && r.Start.After(tfEnd)) {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	if tf.Truncate {
-		if r.Start.Before(tfStart) {
-			r.Start = tfStart
+		if !tfStart.IsZero() && r.Start.Before(tfStart) {
+			remainder := tfStart.Sub(r.Start) % r.Step
+			if remainder > 0 {
+				r.Start = tfStart.Add(r.Step - remainder)
+			} else {
+				r.Start = tfStart
+			}
 		}
-		if r.End.After(tfEnd) {
+		if !tfEnd.IsZero() && r.End.After(tfEnd) {
 			r.End = tfEnd
 		}
 	}
@@ -137,32 +221,36 @@ func (tf *RelativeTimeFilter) Series(ctx context.Context, matches []string, star
 	}
 
 	if tf.Truncate {
-		if startTime.Before(tfStart) {
-			startTime = tfStart
-		}
-		if endTime.After(tfEnd) {
-			endTime = tfEnd
-		}
+		startTime, endTime = truncateWindow(startTime, endTime, tfStart, tfEnd)
 	}
 
 	return tf.API.Series(ctx, matches, startTime, endTime)
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (tf *RelativeTimeFilter) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (model.Value, v1.Warnings, error) {
+func (tf *RelativeTimeFilter) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) storage.SeriesSet {
 	tfStart, tfEnd := tf.window()
 	if (!tfStart.IsZero() && end.Before(tfStart)) || (!tfEnd.IsZero() && start.After(tfEnd)) {
-		return nil, nil, nil
+		return storage.EmptySeriesSet()
 	}
 
 	if tf.Truncate {
-		if start.Before(tfStart) {
-			start = tfStart
-		}
-		if end.After(tfEnd) {
-			end = tfEnd
-		}
+		start, end = truncateWindow(start, end, tfStart, tfEnd)
 	}
 
 	return tf.API.GetValue(ctx, start, end, matchers)
+}
+
+// QueryExemplars performs a query for exemplars by the given query and time range.
+func (tf *RelativeTimeFilter) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) ([]v1.ExemplarQueryResult, error) {
+	tfStart, tfEnd := tf.window()
+	if (!tfStart.IsZero() && endTime.Before(tfStart)) || (!tfEnd.IsZero() && startTime.After(tfEnd)) {
+		return nil, nil
+	}
+
+	if tf.Truncate {
+		startTime, endTime = truncateWindow(startTime, endTime, tfStart, tfEnd)
+	}
+
+	return tf.API.QueryExemplars(ctx, query, startTime, endTime)
 }

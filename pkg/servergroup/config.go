@@ -2,22 +2,32 @@ package servergroup
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/sigv4"
+
+	"github.com/jacksontj/promxy/pkg/promclient"
 
 	"github.com/prometheus/prometheus/discovery"
-	"github.com/prometheus/prometheus/pkg/relabel"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/promql/parser"
 )
 
 var (
 	// DefaultConfig is the Default base promxy configuration
 	DefaultConfig = Config{
-		AntiAffinity:   time.Second * 10,
-		Scheme:         "http",
-		RemoteReadPath: "api/v1/read",
-		Timeout:        0,
+		AntiAffinity:        time.Second * 10,
+		Scheme:              "http",
+		RemoteReadPath:      "api/v1/read",
+		Timeout:             0,
+		MaxIdleConns:        20000,
+		MaxIdleConnsPerHost: 1000,
+		IdleConnTimeout:     5 * time.Minute,
+		PreferMax:           false,
 		HTTPConfig: HTTPClientConfig{
 			DialTimeout: time.Millisecond * 200, // Default dial timeout of 200ms
 		},
@@ -32,6 +42,9 @@ const (
 // Config is the configuration for a ServerGroup that promxy will talk to.
 // This is where the vast majority of options exist.
 type Config struct {
+	Ordinal int `yaml:"-"`
+	// Name is an optional human-readable identifier for this server group.
+	Name string `yaml:"name,omitempty"`
 	// RemoteRead directs promxy to load RAW data (meaning matrix selectors such as `foo[1h]`)
 	// through the RemoteRead API on prom.
 	// Pros:
@@ -53,6 +66,12 @@ type Config struct {
 	RemoteRead bool `yaml:"remote_read"`
 	// RemoteReadPath sets the remote read path for the hosts in this servergroup
 	RemoteReadPath string `yaml:"remote_read_path"`
+
+	// NativeHistogram tunes how promxy serves native-histogram queries
+	// against this server group. The zero value (no `native_histogram`
+	// block in YAML) is "AST-only detection, fail loud if remote_read
+	// can't preserve fidelity" — the safe default. See NativeHistogramConfig.
+	NativeHistogram NativeHistogramConfig `yaml:"native_histogram,omitempty"`
 	// HTTP client config for promxy to use when connecting to the various server_groups
 	// this is the same config as prometheus
 	HTTPConfig HTTPClientConfig `yaml:"http_client"`
@@ -88,6 +107,35 @@ type Config struct {
 	// So in reality its "the same", the difference is in prometheus these apply to the labels/targets of a scrape job,
 	// in promxy they apply to the prometheus hosts in the servergroup - but the behavior is the same.
 	RelabelConfigs []*relabel.Config `yaml:"relabel_configs,omitempty"`
+	// MetricsRelabelConfigs are similar in spirit to prometheus' relabel config but quite different.
+	// As this relabeling is being done within the query-path all relabel actions need to be reversible
+	// so that we can alter queries (e.g. matchers) based on the relabel config. This is done by strictly
+	// limiting the rewrite capability to just those subset of actions that can be reversed. Similar to
+	// prometheus' relabel capability these rules are executed in an order -- so the rules can be compounded
+	// to create relatively complex relabel behavior.
+	// To showcase the versatility, lets look at an example:
+	//
+	//    metrics_relabel_configs:
+	//      # this will drop the `replica` label; enabling replica deduplication
+	//      # similar to thanos -- https://github.com/thanos-io/thanos/blob/master/docs/components/query.md#deduplication
+	//      - action: labeldrop
+	//        source_label: replica
+	//      # this will replace the `job` label with `scrape_job`
+	//      - action: replace
+	//        source_label: job
+	//        target_label: scrape_job
+	//      # this will drop the label `job`.
+	//      - action: labeldrop
+	//        source_label: job
+	//      # this will lowecase the `branch` label in-place (as source_label and target_label match)
+	//      - action: lowercase
+	//        source_label: branch
+	//        target_label: branch
+	//      # this will uppercase the `instance` label into `instanceUpper`
+	//      - action: uppercase
+	//        source_label: instance
+	//        target_label: instanceUpper
+	MetricsRelabelConfigs []*promclient.MetricRelabelConfig `yaml:"metrics_relabel_configs,omitempty"`
 	// ServiceDiscoveryConfigs is a set of ServiceDiscoveryConfig options that allow promxy to discover
 	// all hosts in the server_group
 	ServiceDiscoveryConfigs discovery.Configs `yaml:"-"`
@@ -109,16 +157,42 @@ type Config struct {
 	// come from different points in time. Best practice for this value is to set it to your scrape interval
 	AntiAffinity time.Duration `yaml:"anti_affinity,omitempty"`
 
+	// AntiAffinityDynamic enables per-series anti-affinity inference. When
+	// true, the merge layer infers each series' buffer from the median
+	// inter-sample gap of the longer side and uses AntiAffinity only as the
+	// fallback when there are too few samples to estimate. This is the
+	// right setting when a single server_group hosts series with mixed
+	// scrape intervals (e.g. a 1m-scrape job alongside a 15s-scrape one) —
+	// a single static AntiAffinity is too tight for the slow series (gaps
+	// look like missing data and get gap-filled, doubling count_over_time)
+	// or too wide for the fast one (legitimate fresh samples get deduped).
+	// See https://github.com/jacksontj/promxy/issues/734.
+	AntiAffinityDynamic bool `yaml:"anti_affinity_dynamic,omitempty"`
+
 	// Timeout, if non-zero, specifies the amount of
 	// time to wait for a server's response headers after fully
 	// writing the request (including its body, if any). This
 	// time does not include the time to read the response body.
 	Timeout time.Duration `yaml:"timeout,omitempty"`
 
+	// MaxIdleConns, servergroup maximum number of idle connections to keep open.
+	MaxIdleConns int `yaml:"max_idle_conns,omitempty"`
+
+	// MaxIdleConnsPerHost, servergroup maximum number of idle connections to keep open per host.
+	MaxIdleConnsPerHost int `yaml:"max_idle_conns_per_host,omitempty"`
+
+	// IdleConnTimeout, time wait to close a idle connections.
+	IdleConnTimeout time.Duration `yaml:"idle_conn_timeout,omitempty"`
+
 	// IgnoreError will hide all errors from this given servergroup effectively making
 	// the responses from this servergroup "not required" for the result.
 	// Note: this allows you to make the tradeoff between availability of queries and consistency of results
 	IgnoreError bool `yaml:"ignore_error"`
+
+	// DowngradeError converts all errors to warnings from this given servergroup effectively making
+	// the responses from this servergroup "not required" for the result.
+	// Note: this allows you to make the tradeoff between availability of queries and consistency of results
+	DowngradeError bool `yaml:"downgrade_error"`
 
 	// RelativeTimeRangeConfig defines a relative time range that this servergroup will respond to
 	// An example use-case would be if a specific servergroup was long-term storage, it might only
@@ -129,6 +203,71 @@ type Config struct {
 	// An example use-case would be if a specific servergroup was was "deprecated" and wasn't getting
 	// any new data after a specific given point in time
 	AbsoluteTimeRangeConfig *AbsoluteTimeRangeConfig `yaml:"absolute_time_range"`
+
+	// LabelFilterConfig is a mechanism to restrict which queries are sent to the particular downstream.
+	// This is done by maintaining a "filter" of labels that are downstream and ensuring that the
+	// matchers for any particular query match that in-memory filter. This can be defined both
+	// statically and dynamically.
+	// NOTE: this is not a "secure" mechanism as it is relying on the query's matchers. So it is trivial
+	// for a malicious actor to work around this filter by changing matchers.
+	// Example:
+	//
+	//    label_filter:
+	//      # This will dynamically query the downstream for the values of `__name__` and `job`
+	//      dynamic_labels:
+	//        - __name__
+	//        - job
+	//      # (optional) this will define a re-sync interval for dynamic labels from the downstream
+	//      sync_interval: 5m
+	//      # This will statically define a filter of labels
+	//      static_labels_include:
+	//        instance:
+	//          - instance1
+	//      # This will statically define an exclusion list (removed from the filter)|
+	//      static_labels_exclude:
+	//        __name__:
+	//          - up
+
+	LabelFilterConfig *promclient.LabelFilterConfig `yaml:"label_filter"`
+
+	// InjectMatchers is a list of label matchers that are injected into every selector
+	// of every request sent to this servergroup. This effectively scopes the servergroup
+	// to the subset of downstream data matching these matchers -- even for queries that
+	// never reference the labels being injected (e.g. with `cluster="A"` configured,
+	// `count(up)` is sent downstream as `count(up{cluster="A"})`).
+	//
+	// Each entry is a single matcher in promql syntax (no enclosing braces), e.g.:
+	//
+	//    inject_matchers:
+	//      - 'cluster="A"'
+	//      - 'region=~"us-.*"'
+	//
+	// Unlike `labels` (which only adds labels to responses) and `label_filter` (which only
+	// drops queries that can't match), `inject_matchers` always adds the matchers to the
+	// queries themselves. A common use-case is presenting a per-tenant view of a merged
+	// downstream (e.g. a single Mimir/Thanos/Prometheus holding many clusters) -- see
+	// https://github.com/jacksontj/promxy/issues/698
+	// NOTE: this is not a "secure" mechanism; it only mutates the request matchers and
+	// relies on the downstream honoring them.
+	InjectMatchers []string `yaml:"inject_matchers,omitempty"`
+
+	PreferMax bool `yaml:"prefer_max,omitempty"`
+
+	// HTTPClientHeaders are a map of HTTP headers to add to remote read HTTP calls made to this downstream
+	// the main use-case for this is to support the X-Scope-OrgID header required by Mimir and Cortex
+	// in multi-tenancy mode
+	// (see https://github.com/jacksontj/promxy/issues/643)
+	HTTPClientHeaders map[string]string `yaml:"http_headers"`
+
+	// AlignQueryRangeWithStep declares that this backend snaps query_range results
+	// to the epoch step grid (k*step), as Mimir/Cortex do by default. When set,
+	// promxy re-stamps the returned samples back onto the grid implied by the
+	// request start (start + j*step) so they line up with promxy's local
+	// evaluation grid. Without it, an unaligned request (start % step != 0) whose
+	// off-grid distance exceeds the lookback-delta yields no data for this backend.
+	// Leave it OFF for backends that do not step-align (e.g. vanilla Prometheus);
+	// their samples already sit on the requested grid. See issue #787.
+	AlignQueryRangeWithStep bool `yaml:"align_query_range_with_step,omitempty"`
 }
 
 // GetScheme returns the scheme for this servergroup
@@ -141,6 +280,26 @@ func (c *Config) GetAntiAffinity() model.Time {
 	return model.TimeFromUnix(int64((c.AntiAffinity).Seconds()))
 }
 
+// GetPreferMax returns the PreferMax setting for this servergroup
+func (c *Config) GetPreferMax() bool {
+	return c.PreferMax
+}
+
+// GetInjectMatchers parses the configured InjectMatchers entries into label matchers.
+// It returns nil if no matchers are configured.
+func (c *Config) GetInjectMatchers() ([]*labels.Matcher, error) {
+	if len(c.InjectMatchers) == 0 {
+		return nil, nil
+	}
+	// Join the individual matcher entries into a single selector and parse it. Each entry
+	// is expected to be a bare matcher (e.g. `cluster="A"`) without enclosing braces.
+	matchers, err := parser.ParseMetricSelector("{" + strings.Join(c.InjectMatchers, ",") + "}")
+	if err != nil {
+		return nil, fmt.Errorf("error parsing inject_matchers: %w", err)
+	}
+	return matchers, nil
+}
+
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
 func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	*c = DefaultConfig
@@ -149,13 +308,142 @@ func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 
+	if err := c.validateAuthConfig(); err != nil {
+		return err
+	}
+
+	if err := c.HTTPConfig.validate(); err != nil {
+		return err
+	}
+
+	// Validate inject_matchers parses at config-load time rather than failing later
+	// during a discovery sync.
+	if _, err := c.GetInjectMatchers(); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// validateAuthConfig ensures that at most one authentication method is configured
+func (c *Config) validateAuthConfig() error {
+	authMethods := []string{}
+
+	if c.HTTPConfig.HTTPConfig.BasicAuth != nil {
+		authMethods = append(authMethods, "basic_auth")
+	}
+
+	if c.HTTPConfig.HTTPConfig.Authorization != nil {
+		authMethods = append(authMethods, "authorization")
+	}
+
+	if len(c.HTTPConfig.HTTPConfig.BearerToken) > 0 {
+		authMethods = append(authMethods, "bearer_token")
+	}
+
+	if len(c.HTTPConfig.HTTPConfig.BearerTokenFile) > 0 {
+		authMethods = append(authMethods, "bearer_token_file")
+	}
+
+	if c.HTTPConfig.SigV4Config != nil {
+		authMethods = append(authMethods, "sigv4")
+	}
+
+	if len(authMethods) > 1 {
+		return fmt.Errorf("at most one of basic_auth, authorization, bearer_token, bearer_token_file, sigv4 must be configured")
+	}
+
+	return nil
+}
+
+// MarshalYAML implements the yaml.Marshaler interface.
+func (c *Config) MarshalYAML() (interface{}, error) {
+	return discovery.MarshalYAMLWithInlineConfigs(c)
 }
 
 // HTTPClientConfig extends prometheus' HTTPClientConfig
 type HTTPClientConfig struct {
-	DialTimeout time.Duration                `yaml:"dial_timeout"`
+	DialTimeout time.Duration `yaml:"dial_timeout"`
+	// DialNetwork controls the address family used when dialing downstream hosts.
+	// It maps to the network passed to net.Dialer: "tcp" (default) does dual-stack
+	// dialing, while "tcp4"/"tcp6" force IPv4/IPv6 respectively. An empty value is
+	// treated as "tcp".
+	DialNetwork string `yaml:"dial_network,omitempty"`
+	// FallbackDelay maps to net.Dialer.FallbackDelay and controls how long the
+	// dual-stack (RFC 6555 "Happy Eyeballs") dialer waits before spawning a
+	// fallback connection to the other address family. A zero value uses Go's
+	// default (300ms); a negative value disables the fallback attempt entirely.
+	// Note: to be effective it must be shorter than DialTimeout, otherwise the
+	// dial times out before the fallback is ever attempted.
+	FallbackDelay time.Duration `yaml:"fallback_delay,omitempty"`
+	// HTTPConfig is prometheus' HTTPClientConfig, inlined -- so its keys
+	// (tls_config, proxy_url, basic_auth, bearer_token, enable_http2, ...) sit
+	// directly under `http_client`. Note that promxy builds its own
+	// http.Transport rather than calling config_util.NewRoundTripperFromConfig,
+	// so only the subset of these fields that promxy explicitly reads has any
+	// effect. `enable_http2` is one that it does read -- see HTTP2Enabled.
 	HTTPConfig  config_util.HTTPClientConfig `yaml:",inline"`
+	SigV4Config *sigv4.SigV4Config           `yaml:"sigv4,omitempty"`
+}
+
+// HTTP2Enabled reports whether promxy should negotiate HTTP/2 with this server
+// group's downstream hosts. It is the inlined `http_client.enable_http2` key,
+// and defaults to false -- which preserves promxy's historical behavior of
+// HTTP/1.1 only. (Note this default differs from prometheus'
+// DefaultHTTPClientConfig, which enables HTTP/2; promxy never seeds that
+// default onto this struct, and the field is deliberately left off so an
+// upgrade doesn't silently change the downstream protocol.)
+//
+// Why a knob is needed at all: promxy always sets both TLSClientConfig and
+// DialContext on the downstream http.Transport (for TLS options and for
+// dial_network/dial_timeout/fallback_delay). Go's transport conservatively
+// disables its automatic HTTP/2 wiring whenever any of TLSClientConfig, Dial,
+// DialTLS or DialContext is set, unless ForceAttemptHTTP2 is explicitly true
+// (see net/http.Transport.protocols). So without this option every server group
+// speaks HTTP/1.1, no matter the scheme.
+//
+// This only takes effect for `https` targets: HTTP/2 is negotiated over TLS via
+// ALPN, so a `scheme: http` server group is unaffected by this setting.
+//
+// Trade-offs -- HTTP/2 is not unambiguously better for promxy's traffic shape,
+// which is a modest number of large, sequential response bodies per target:
+//   - Pro: one multiplexed connection per target instead of up to
+//     max_idle_conns_per_host sockets, so far fewer file descriptors and TLS
+//     handshakes, and much less connection churn against downstreams (and any
+//     LB/proxy in between).
+//   - Con: h2's per-stream flow-control window can make large response bodies
+//     *slower* than HTTP/1.1 over a warm connection pool.
+//   - Con: every concurrent query for a target shares one TCP connection, so
+//     one stalled or lossy connection affects all in-flight queries to that
+//     host, rather than just the one using that socket.
+//
+// Measure before enabling it in production.
+//
+// Note also that max_idle_conns/max_idle_conns_per_host mean something quite
+// different once HTTP/2 is in play: they bound idle *connections*, but h2
+// multiplexes all requests to a host over a single connection, so the effective
+// per-host concurrency limit becomes the peer's SETTINGS_MAX_CONCURRENT_STREAMS
+// rather than max_idle_conns_per_host.
+func (c *HTTPClientConfig) HTTP2Enabled() bool {
+	return c.HTTPConfig.EnableHTTP2
+}
+
+// validate ensures the HTTPClientConfig has sane values.
+func (c *HTTPClientConfig) validate() error {
+	switch c.DialNetwork {
+	case "", "tcp", "tcp4", "tcp6":
+	default:
+		return fmt.Errorf("invalid dial_network %q: must be one of tcp, tcp4, tcp6", c.DialNetwork)
+	}
+	return nil
+}
+
+// DialNetworkOrDefault returns the configured dial network, defaulting to "tcp".
+func (c *HTTPClientConfig) DialNetworkOrDefault() string {
+	if c.DialNetwork == "" {
+		return "tcp"
+	}
+	return c.DialNetwork
 }
 
 // RelativeTimeRangeConfig configures durations relative from "now" to define
@@ -205,4 +493,52 @@ func (tr *AbsoluteTimeRangeConfig) validate() error {
 		return fmt.Errorf("AbsoluteTimeRangeConfig: End must be after start")
 	}
 	return nil
+}
+
+// NativeHistogramConfig groups the per-server-group knobs that control how
+// promxy handles native-histogram queries. Native histograms only round-trip
+// with full fidelity over remote_read — the HTTP-API JSON path collapses
+// sparse spans and drops empty buckets. Promxy detects histogram-bearing
+// queries from the PromQL AST (and optionally from a metric-name metadata
+// cache) and skips HTTP-API pushdown for them so the embedded engine
+// evaluates locally, fetching raw data via remote_read.
+//
+// The zero value is a safe default: AST-only detection, and any histogram
+// query that targets a server group without remote_read errors out rather
+// than silently returning lossy data.
+type NativeHistogramConfig struct {
+	// MetadataRefresh controls the metric-name → type cache. When zero
+	// (the default), detection is pure AST: a Call to one of the
+	// histogram-only PromQL functions (histogram_avg, histogram_count,
+	// histogram_sum, histogram_stddev, histogram_stdvar,
+	// histogram_fraction). This misses queries that touch histogram
+	// metrics without invoking those functions — e.g. `rate(my_hist[5m])`.
+	//
+	// Set MetadataRefresh to a positive duration to enable the cache:
+	// promxy periodically calls /api/v1/metadata on this server group,
+	// extracts the histogram-typed metric names, and consults the union
+	// of all groups' caches when classifying queries. The cache is
+	// name-keyed (typically <2% of the total metric-name space) so
+	// memory is bounded by histogram-name count, not series cardinality.
+	//
+	// Cost: each refresh pulls a full /api/v1/metadata body (every
+	// metric name, help string and unit) from one target of the group,
+	// not from every replica — but that body can still be tens of MB in
+	// a large deployment, so pick the interval accordingly. Metric
+	// names change on deploys, not on scrapes; minutes, not seconds.
+	MetadataRefresh time.Duration `yaml:"metadata_refresh,omitempty"`
+
+	// AllowLossy controls what happens when a histogram-bearing query
+	// targets this server group and remote_read isn't configured.
+	//
+	//   false (default): the query errors out before fan-out. Wrong data
+	//     is worse than no data — the operator should configure
+	//     remote_read (or explicitly opt into lossy fallback) rather
+	//     than silently serve histograms over the lossy JSON path.
+	//
+	//   true: the query proceeds via the HTTP API even though the
+	//     response will be lossy for histogram samples. Use when you
+	//     accept the fidelity loss (e.g. dashboards that only consume
+	//     histogram_quantile output and don't care about sparse spans).
+	AllowLossy bool `yaml:"allow_lossy,omitempty"`
 }

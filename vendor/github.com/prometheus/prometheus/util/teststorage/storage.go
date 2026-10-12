@@ -14,13 +14,15 @@
 package teststorage
 
 import (
-	"io/ioutil"
+	"fmt"
 	"os"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/prometheus/pkg/exemplar"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/stretchr/testify/require"
+
+	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/util/testutil"
@@ -28,10 +30,18 @@ import (
 
 // New returns a new TestStorage for testing purposes
 // that removes all associated files on closing.
-func New(t testutil.T) *TestStorage {
-	dir, err := ioutil.TempDir("", "test_storage")
+func New(t testutil.T, outOfOrderTimeWindow ...int64) *TestStorage {
+	stor, err := NewWithError(outOfOrderTimeWindow...)
+	require.NoError(t, err)
+	return stor
+}
+
+// NewWithError returns a new TestStorage for user facing tests, which reports
+// errors directly.
+func NewWithError(outOfOrderTimeWindow ...int64) (*TestStorage, error) {
+	dir, err := os.MkdirTemp("", "test_storage")
 	if err != nil {
-		t.Fatalf("Opening test dir failed: %s", err)
+		return nil, fmt.Errorf("opening test directory: %w", err)
 	}
 
 	// Tests just load data for a series sequentially. Thus we
@@ -39,18 +49,28 @@ func New(t testutil.T) *TestStorage {
 	opts := tsdb.DefaultOptions()
 	opts.MinBlockDuration = int64(24 * time.Hour / time.Millisecond)
 	opts.MaxBlockDuration = int64(24 * time.Hour / time.Millisecond)
+	opts.RetentionDuration = 0
+	opts.EnableNativeHistograms = true
+
+	// Set OutOfOrderTimeWindow if provided, otherwise use default (0)
+	if len(outOfOrderTimeWindow) > 0 {
+		opts.OutOfOrderTimeWindow = outOfOrderTimeWindow[0]
+	} else {
+		opts.OutOfOrderTimeWindow = 0 // Default value is zero
+	}
+
 	db, err := tsdb.Open(dir, nil, nil, opts, tsdb.NewDBStats())
 	if err != nil {
-		t.Fatalf("Opening test storage failed: %s", err)
+		return nil, fmt.Errorf("opening test storage: %w", err)
 	}
 	reg := prometheus.NewRegistry()
 	eMetrics := tsdb.NewExemplarMetrics(reg)
 
 	es, err := tsdb.NewCircularExemplarStorage(10, eMetrics)
 	if err != nil {
-		t.Fatalf("Opening test exemplar storage failed: %s", err)
+		return nil, fmt.Errorf("opening test exemplar storage: %w", err)
 	}
-	return &TestStorage{DB: db, exemplarStorage: es, dir: dir}
+	return &TestStorage{DB: db, exemplarStorage: es, dir: dir}, nil
 }
 
 type TestStorage struct {
@@ -74,6 +94,6 @@ func (s TestStorage) ExemplarQueryable() storage.ExemplarQueryable {
 	return s.exemplarStorage
 }
 
-func (s TestStorage) AppendExemplar(ref uint64, l labels.Labels, e exemplar.Exemplar) (uint64, error) {
+func (s TestStorage) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e exemplar.Exemplar) (storage.SeriesRef, error) {
 	return ref, s.exemplarStorage.AddExemplar(l, e)
 }

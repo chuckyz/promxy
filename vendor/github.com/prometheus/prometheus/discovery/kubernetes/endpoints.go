@@ -15,15 +15,15 @@ package kubernetes
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 
-	"github.com/prometheus/prometheus/util/strutil"
-
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -31,19 +31,15 @@ import (
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 )
 
-var (
-	epAddCount    = eventCount.WithLabelValues("endpoints", "add")
-	epUpdateCount = eventCount.WithLabelValues("endpoints", "update")
-	epDeleteCount = eventCount.WithLabelValues("endpoints", "delete")
-)
-
 // Endpoints discovers new endpoint targets.
 type Endpoints struct {
-	logger log.Logger
+	logger *slog.Logger
 
-	endpointsInf cache.SharedInformer
-	serviceInf   cache.SharedInformer
-	podInf       cache.SharedInformer
+	endpointsInf     cache.SharedIndexInformer
+	serviceInf       cache.SharedInformer
+	podInf           cache.SharedInformer
+	nodeInf          cache.SharedInformer
+	withNodeMetadata bool
 
 	podStore       cache.Store
 	endpointsStore cache.Store
@@ -53,22 +49,36 @@ type Endpoints struct {
 }
 
 // NewEndpoints returns a new endpoints discovery.
-func NewEndpoints(l log.Logger, svc, eps, pod cache.SharedInformer) *Endpoints {
+// Endpoints API is deprecated in k8s v1.33+, but we should still support it.
+func NewEndpoints(l *slog.Logger, eps cache.SharedIndexInformer, svc, pod, node cache.SharedInformer, eventCount *prometheus.CounterVec) *Endpoints {
 	if l == nil {
-		l = log.NewNopLogger()
-	}
-	e := &Endpoints{
-		logger:         l,
-		endpointsInf:   eps,
-		endpointsStore: eps.GetStore(),
-		serviceInf:     svc,
-		serviceStore:   svc.GetStore(),
-		podInf:         pod,
-		podStore:       pod.GetStore(),
-		queue:          workqueue.NewNamed("endpoints"),
+		l = promslog.NewNopLogger()
 	}
 
-	e.endpointsInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	epAddCount := eventCount.WithLabelValues(RoleEndpoint.String(), MetricLabelRoleAdd)
+	epUpdateCount := eventCount.WithLabelValues(RoleEndpoint.String(), MetricLabelRoleUpdate)
+	epDeleteCount := eventCount.WithLabelValues(RoleEndpoint.String(), MetricLabelRoleDelete)
+
+	svcAddCount := eventCount.WithLabelValues(RoleService.String(), MetricLabelRoleAdd)
+	svcUpdateCount := eventCount.WithLabelValues(RoleService.String(), MetricLabelRoleUpdate)
+	svcDeleteCount := eventCount.WithLabelValues(RoleService.String(), MetricLabelRoleDelete)
+
+	podUpdateCount := eventCount.WithLabelValues(RolePod.String(), MetricLabelRoleUpdate)
+
+	e := &Endpoints{
+		logger:           l,
+		endpointsInf:     eps,
+		endpointsStore:   eps.GetStore(),
+		serviceInf:       svc,
+		serviceStore:     svc.GetStore(),
+		podInf:           pod,
+		podStore:         pod.GetStore(),
+		nodeInf:          node,
+		withNodeMetadata: node != nil,
+		queue:            workqueue.NewNamed(RoleEndpoint.String()),
+	}
+
+	_, err := e.endpointsInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(o interface{}) {
 			epAddCount.Inc()
 			e.enqueue(o)
@@ -82,27 +92,27 @@ func NewEndpoints(l log.Logger, svc, eps, pod cache.SharedInformer) *Endpoints {
 			e.enqueue(o)
 		},
 	})
+	if err != nil {
+		l.Error("Error adding endpoints event handler.", "err", err)
+	}
 
 	serviceUpdate := func(o interface{}) {
 		svc, err := convertToService(o)
 		if err != nil {
-			level.Error(e.logger).Log("msg", "converting to Service object failed", "err", err)
+			e.logger.Error("converting to Service object failed", "err", err)
 			return
 		}
 
-		ep := &apiv1.Endpoints{}
-		ep.Namespace = svc.Namespace
-		ep.Name = svc.Name
-		obj, exists, err := e.endpointsStore.Get(ep)
+		obj, exists, err := e.endpointsStore.GetByKey(namespacedName(svc.Namespace, svc.Name))
 		if exists && err == nil {
 			e.enqueue(obj.(*apiv1.Endpoints))
 		}
 
 		if err != nil {
-			level.Error(e.logger).Log("msg", "retrieving endpoints failed", "err", err)
+			e.logger.Error("retrieving endpoints failed", "err", err)
 		}
 	}
-	e.serviceInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err = e.serviceInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		// TODO(fabxc): potentially remove add and delete event handlers. Those should
 		// be triggered via the endpoint handlers already.
 		AddFunc: func(o interface{}) {
@@ -118,8 +128,80 @@ func NewEndpoints(l log.Logger, svc, eps, pod cache.SharedInformer) *Endpoints {
 			serviceUpdate(o)
 		},
 	})
+	if err != nil {
+		l.Error("Error adding services event handler.", "err", err)
+	}
+	_, err = e.podInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(old, cur interface{}) {
+			podUpdateCount.Inc()
+			oldPod, ok := old.(*apiv1.Pod)
+			if !ok {
+				return
+			}
+
+			curPod, ok := cur.(*apiv1.Pod)
+			if !ok {
+				return
+			}
+
+			// the Pod's phase may change without triggering an update on the Endpoints/Service.
+			// https://github.com/prometheus/prometheus/issues/11305.
+			if curPod.Status.Phase != oldPod.Status.Phase {
+				e.enqueuePod(namespacedName(curPod.Namespace, curPod.Name))
+			}
+		},
+	})
+	if err != nil {
+		l.Error("Error adding pods event handler.", "err", err)
+	}
+	if e.withNodeMetadata {
+		_, err = e.nodeInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc: func(o interface{}) {
+				node := o.(*apiv1.Node)
+				e.enqueueNode(node.Name)
+			},
+			UpdateFunc: func(_, o interface{}) {
+				node := o.(*apiv1.Node)
+				e.enqueueNode(node.Name)
+			},
+			DeleteFunc: func(o interface{}) {
+				nodeName, err := nodeName(o)
+				if err != nil {
+					l.Error("Error getting Node name", "err", err)
+				}
+				e.enqueueNode(nodeName)
+			},
+		})
+		if err != nil {
+			l.Error("Error adding nodes event handler.", "err", err)
+		}
+	}
 
 	return e
+}
+
+func (e *Endpoints) enqueueNode(nodeName string) {
+	endpoints, err := e.endpointsInf.GetIndexer().ByIndex(nodeIndex, nodeName)
+	if err != nil {
+		e.logger.Error("Error getting endpoints for node", "node", nodeName, "err", err)
+		return
+	}
+
+	for _, endpoint := range endpoints {
+		e.enqueue(endpoint)
+	}
+}
+
+func (e *Endpoints) enqueuePod(podNamespacedName string) {
+	endpoints, err := e.endpointsInf.GetIndexer().ByIndex(podIndex, podNamespacedName)
+	if err != nil {
+		e.logger.Error("Error getting endpoints for pod", "pod", podNamespacedName, "err", err)
+		return
+	}
+
+	for _, endpoint := range endpoints {
+		e.enqueue(endpoint)
+	}
 }
 
 func (e *Endpoints) enqueue(obj interface{}) {
@@ -135,9 +217,14 @@ func (e *Endpoints) enqueue(obj interface{}) {
 func (e *Endpoints) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	defer e.queue.ShutDown()
 
-	if !cache.WaitForCacheSync(ctx.Done(), e.endpointsInf.HasSynced, e.serviceInf.HasSynced, e.podInf.HasSynced) {
-		if ctx.Err() != context.Canceled {
-			level.Error(e.logger).Log("msg", "endpoints informer unable to sync cache")
+	cacheSyncs := []cache.InformerSynced{e.endpointsInf.HasSynced, e.serviceInf.HasSynced, e.podInf.HasSynced}
+	if e.withNodeMetadata {
+		cacheSyncs = append(cacheSyncs, e.nodeInf.HasSynced)
+	}
+
+	if !cache.WaitForCacheSync(ctx.Done(), cacheSyncs...) {
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			e.logger.Error("endpoints informer unable to sync cache")
 		}
 		return
 	}
@@ -161,13 +248,13 @@ func (e *Endpoints) process(ctx context.Context, ch chan<- []*targetgroup.Group)
 
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
-		level.Error(e.logger).Log("msg", "splitting key failed", "key", key)
+		e.logger.Error("splitting key failed", "key", key)
 		return true
 	}
 
 	o, exists, err := e.endpointsStore.GetByKey(key)
 	if err != nil {
-		level.Error(e.logger).Log("msg", "getting object from store failed", "key", key)
+		e.logger.Error("getting object from store failed", "key", key)
 		return true
 	}
 	if !exists {
@@ -176,7 +263,7 @@ func (e *Endpoints) process(ctx context.Context, ch chan<- []*targetgroup.Group)
 	}
 	eps, err := convertToEndpoints(o)
 	if err != nil {
-		level.Error(e.logger).Log("msg", "converting to Endpoints object failed", "err", err)
+		e.logger.Error("converting to Endpoints object failed", "err", err)
 		return true
 	}
 	send(ctx, ch, e.buildEndpoints(eps))
@@ -189,7 +276,7 @@ func convertToEndpoints(o interface{}) (*apiv1.Endpoints, error) {
 		return endpoints, nil
 	}
 
-	return nil, errors.Errorf("received unexpected object: %v", o)
+	return nil, fmt.Errorf("received unexpected object: %v", o)
 }
 
 func endpointsSource(ep *apiv1.Endpoints) string {
@@ -201,9 +288,6 @@ func endpointsSourceFromNamespaceAndName(namespace, name string) string {
 }
 
 const (
-	endpointsLabelPrefix           = metaLabelPrefix + "endpoints_label_"
-	endpointsLabelPresentPrefix    = metaLabelPrefix + "endpoints_labelpresent_"
-	endpointsNameLabel             = metaLabelPrefix + "endpoints_name"
 	endpointNodeName               = metaLabelPrefix + "endpoint_node_name"
 	endpointHostname               = metaLabelPrefix + "endpoint_hostname"
 	endpointReadyLabel             = metaLabelPrefix + "endpoint_ready"
@@ -218,16 +302,11 @@ func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) *targetgroup.Group {
 		Source: endpointsSource(eps),
 	}
 	tg.Labels = model.LabelSet{
-		namespaceLabel:     lv(eps.Namespace),
-		endpointsNameLabel: lv(eps.Name),
+		namespaceLabel: lv(eps.Namespace),
 	}
 	e.addServiceLabels(eps.Namespace, eps.Name, tg)
 	// Add endpoints labels metadata.
-	for k, v := range eps.Labels {
-		ln := strutil.SanitizeLabelName(k)
-		tg.Labels[model.LabelName(endpointsLabelPrefix+ln)] = lv(v)
-		tg.Labels[model.LabelName(endpointsLabelPresentPrefix+ln)] = presentValue
-	}
+	addObjectMetaLabels(tg.Labels, eps.ObjectMeta, RoleEndpoint)
 
 	type podEntry struct {
 		pod          *apiv1.Pod
@@ -257,13 +336,21 @@ func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) *targetgroup.Group {
 			target[model.LabelName(endpointHostname)] = lv(addr.Hostname)
 		}
 
+		if e.withNodeMetadata {
+			if addr.NodeName != nil {
+				target = addNodeLabels(target, e.nodeInf, e.logger, addr.NodeName)
+			} else if addr.TargetRef != nil && addr.TargetRef.Kind == "Node" {
+				target = addNodeLabels(target, e.nodeInf, e.logger, &addr.TargetRef.Name)
+			}
+		}
+
 		pod := e.resolvePodRef(addr.TargetRef)
 		if pod == nil {
 			// This target is not a Pod, so don't continue with Pod specific logic.
 			tg.Targets = append(tg.Targets, target)
 			return
 		}
-		s := pod.Namespace + "/" + pod.Name
+		s := namespacedName(pod.Namespace, pod.Name)
 
 		sp, ok := seenPods[s]
 		if !ok {
@@ -275,15 +362,19 @@ func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) *targetgroup.Group {
 		target = target.Merge(podLabels(pod))
 
 		// Attach potential container port labels matching the endpoint port.
-		for _, c := range pod.Spec.Containers {
+		containers := append(pod.Spec.Containers, pod.Spec.InitContainers...)
+		for i, c := range containers {
 			for _, cport := range c.Ports {
 				if port.Port == cport.ContainerPort {
 					ports := strconv.FormatUint(uint64(port.Port), 10)
+					isInit := i >= len(pod.Spec.Containers)
 
 					target[podContainerNameLabel] = lv(c.Name)
+					target[podContainerImageLabel] = lv(c.Image)
 					target[podContainerPortNameLabel] = lv(cport.Name)
 					target[podContainerPortNumberLabel] = lv(ports)
 					target[podContainerPortProtocolLabel] = lv(string(port.Protocol))
+					target[podContainerIsInit] = lv(strconv.FormatBool(isInit))
 					break
 				}
 			}
@@ -308,10 +399,24 @@ func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) *targetgroup.Group {
 		}
 	}
 
+	v := eps.Labels[apiv1.EndpointsOverCapacity]
+	if v == "truncated" {
+		e.logger.Warn("Number of endpoints in one Endpoints object exceeds 1000 and has been truncated, please use \"role: endpointslice\" instead", "endpoint", eps.Name)
+	}
+	if v == "warning" {
+		e.logger.Warn("Number of endpoints in one Endpoints object exceeds 1000, please use \"role: endpointslice\" instead", "endpoint", eps.Name)
+	}
+
 	// For all seen pods, check all container ports. If they were not covered
 	// by one of the service endpoints, generate targets for them.
 	for _, pe := range seenPods {
-		for _, c := range pe.pod.Spec.Containers {
+		// PodIP can be empty when a pod is starting or has been evicted.
+		if len(pe.pod.Status.PodIP) == 0 {
+			continue
+		}
+
+		containers := append(pe.pod.Spec.Containers, pe.pod.Spec.InitContainers...)
+		for i, c := range containers {
 			for _, cport := range c.Ports {
 				hasSeenPort := func() bool {
 					for _, eport := range pe.servicePorts {
@@ -328,12 +433,15 @@ func (e *Endpoints) buildEndpoints(eps *apiv1.Endpoints) *targetgroup.Group {
 				a := net.JoinHostPort(pe.pod.Status.PodIP, strconv.FormatUint(uint64(cport.ContainerPort), 10))
 				ports := strconv.FormatUint(uint64(cport.ContainerPort), 10)
 
+				isInit := i >= len(pe.pod.Spec.Containers)
 				target := model.LabelSet{
 					model.AddressLabel:            lv(a),
 					podContainerNameLabel:         lv(c.Name),
+					podContainerImageLabel:        lv(c.Image),
 					podContainerPortNameLabel:     lv(cport.Name),
 					podContainerPortNumberLabel:   lv(ports),
 					podContainerPortProtocolLabel: lv(string(cport.Protocol)),
+					podContainerIsInit:            lv(strconv.FormatBool(isInit)),
 				}
 				tg.Targets = append(tg.Targets, target.Merge(podLabels(pe.pod)))
 			}
@@ -347,13 +455,10 @@ func (e *Endpoints) resolvePodRef(ref *apiv1.ObjectReference) *apiv1.Pod {
 	if ref == nil || ref.Kind != "Pod" {
 		return nil
 	}
-	p := &apiv1.Pod{}
-	p.Namespace = ref.Namespace
-	p.Name = ref.Name
 
-	obj, exists, err := e.podStore.Get(p)
+	obj, exists, err := e.podStore.GetByKey(namespacedName(ref.Namespace, ref.Name))
 	if err != nil {
-		level.Error(e.logger).Log("msg", "resolving pod ref failed", "err", err)
+		e.logger.Error("resolving pod ref failed", "err", err)
 		return nil
 	}
 	if !exists {
@@ -363,19 +468,37 @@ func (e *Endpoints) resolvePodRef(ref *apiv1.ObjectReference) *apiv1.Pod {
 }
 
 func (e *Endpoints) addServiceLabels(ns, name string, tg *targetgroup.Group) {
-	svc := &apiv1.Service{}
-	svc.Namespace = ns
-	svc.Name = name
-
-	obj, exists, err := e.serviceStore.Get(svc)
+	obj, exists, err := e.serviceStore.GetByKey(namespacedName(ns, name))
 	if err != nil {
-		level.Error(e.logger).Log("msg", "retrieving service failed", "err", err)
+		e.logger.Error("retrieving service failed", "err", err)
 		return
 	}
 	if !exists {
 		return
 	}
-	svc = obj.(*apiv1.Service)
+	svc := obj.(*apiv1.Service)
 
 	tg.Labels = tg.Labels.Merge(serviceLabels(svc))
+}
+
+func addNodeLabels(tg model.LabelSet, nodeInf cache.SharedInformer, logger *slog.Logger, nodeName *string) model.LabelSet {
+	if nodeName == nil {
+		return tg
+	}
+
+	obj, exists, err := nodeInf.GetStore().GetByKey(*nodeName)
+	if err != nil {
+		logger.Error("Error getting node", "node", *nodeName, "err", err)
+		return tg
+	}
+
+	if !exists {
+		return tg
+	}
+
+	node := obj.(*apiv1.Node)
+	// Allocate one target label for the node name,
+	nodeLabelset := make(model.LabelSet)
+	addObjectMetaLabels(nodeLabelset, node.ObjectMeta, RoleNode)
+	return tg.Merge(nodeLabelset)
 }

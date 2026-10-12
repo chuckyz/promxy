@@ -6,7 +6,8 @@ import (
 
 	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
 )
 
 // recoverAPI simply recovers all panics and returns them as errors
@@ -34,20 +35,20 @@ func (api *recoverAPI) LabelValues(ctx context.Context, label string, matchers [
 }
 
 // Query performs a query for the given time.
-func (api *recoverAPI) Query(ctx context.Context, query string, ts time.Time) (v model.Value, w v1.Warnings, err error) {
+func (api *recoverAPI) Query(ctx context.Context, query string, ts time.Time) (ss storage.SeriesSet) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = r.(error)
+			ss = storage.ErrSeriesSet(r.(error))
 		}
 	}()
 	return api.A.Query(ctx, query, ts)
 }
 
 // QueryRange performs a query for the given range.
-func (api *recoverAPI) QueryRange(ctx context.Context, query string, r v1.Range) (v model.Value, w v1.Warnings, err error) {
+func (api *recoverAPI) QueryRange(ctx context.Context, query string, r v1.Range) (ss storage.SeriesSet) {
 	defer func() {
-		if r := recover(); r != nil {
-			err = r.(error)
+		if rec := recover(); rec != nil {
+			ss = storage.ErrSeriesSet(rec.(error))
 		}
 	}()
 	return api.A.QueryRange(ctx, query, r)
@@ -64,11 +65,31 @@ func (api *recoverAPI) Series(ctx context.Context, matches []string, startTime t
 }
 
 // GetValue loads the raw data for a given set of matchers in the time range
-func (api *recoverAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (v model.Value, w v1.Warnings, err error) {
+func (api *recoverAPI) GetValue(ctx context.Context, start, end time.Time, matchers []*labels.Matcher) (ss storage.SeriesSet) {
+	defer func() {
+		if r := recover(); r != nil {
+			ss = storage.ErrSeriesSet(r.(error))
+		}
+	}()
+	return api.A.GetValue(ctx, start, end, matchers)
+}
+
+// Metadata returns metadata about metrics currently scraped by the metric name.
+func (api *recoverAPI) Metadata(ctx context.Context, metric, limit string) (v map[string][]v1.Metadata, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = r.(error)
 		}
 	}()
-	return api.A.GetValue(ctx, start, end, matchers)
+	return api.A.Metadata(ctx, metric, limit)
+}
+
+// QueryExemplars performs a query for exemplars by the given query and time range.
+func (api *recoverAPI) QueryExemplars(ctx context.Context, query string, startTime, endTime time.Time) (v []v1.ExemplarQueryResult, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = r.(error)
+		}
+	}()
+	return api.A.QueryExemplars(ctx, query, startTime, endTime)
 }

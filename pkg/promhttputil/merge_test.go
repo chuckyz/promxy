@@ -2,204 +2,43 @@ package promhttputil
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/prometheus/common/model"
 )
 
-/*
-   ValNone ValueType = iota
-   ValScalar
-   ValVector
-   ValMatrix
-   ValString
+// mergeMatrix folds two matrices into one the way the HA merge does: group
+// the streams by fingerprint and hand each collision to MergeSampleStream.
+// Streams that appear on only one side are carried through untouched.
+func mergeMatrix(antiAffinityBuffer model.Time, dynamic bool, a, b model.Matrix, preferMax bool) model.Matrix {
+	merged := make(model.Matrix, 0, len(a)+len(b))
+	index := make(map[model.Fingerprint]int, len(a)+len(b))
 
-*/
-// Merge 2 values and
-func TestMergeValues(t *testing.T) {
+	for _, stream := range slices.Concat(a, b) {
+		finger := stream.Metric.Fingerprint()
+		if i, ok := index[finger]; ok {
+			// The only error MergeSampleStream returns is a fingerprint
+			// mismatch, which the index makes impossible here.
+			merged[i], _ = MergeSampleStream(antiAffinityBuffer, dynamic, merged[i], stream, preferMax)
+			continue
+		}
+		merged = append(merged, stream)
+		index[finger] = len(merged) - 1
+	}
+
+	return merged
+}
+
+func TestMergeMatrix(t *testing.T) {
 	tests := []struct {
 		name         string
-		a            model.Value
-		b            model.Value
-		r            model.Value
+		a            model.Matrix
+		b            model.Matrix
+		r            model.Matrix
 		antiAffinity model.Time
-		err          error
+		preferMax    bool
 	}{
-		//
-		// edge-cases
-		{
-			name: "nils",
-			a:    nil,
-			b:    nil,
-			r:    nil,
-		},
-
-		{
-			name: "bnil",
-			a:    &model.Scalar{model.SampleValue(10), model.Time(100)},
-			b:    nil,
-			r:    &model.Scalar{model.SampleValue(10), model.Time(100)},
-		},
-
-		{
-			name: "anil",
-			a:    nil,
-			b:    &model.Scalar{model.SampleValue(10), model.Time(100)},
-			r:    &model.Scalar{model.SampleValue(10), model.Time(100)},
-		},
-
-		//
-		// Scalar tests
-		{
-			name: "scalar dedupe",
-			a:    &model.Scalar{model.SampleValue(10), model.Time(100)},
-			b:    &model.Scalar{model.SampleValue(10), model.Time(100)},
-			r:    &model.Scalar{model.SampleValue(10), model.Time(100)},
-		},
-
-		// Fill missing
-		{
-			name: "scalar fill missing",
-			a:    &model.Scalar{model.SampleValue(10), model.Time(100)},
-			b:    &model.Scalar{},
-			r:    &model.Scalar{model.SampleValue(10), model.Time(100)},
-		},
-
-		// Fill missing
-		{
-			name: "scalar fill missing",
-			a:    &model.Scalar{},
-			b:    &model.Scalar{model.SampleValue(10), model.Time(100)},
-			r:    &model.Scalar{model.SampleValue(10), model.Time(100)},
-		},
-
-		//
-		// String tests
-		{
-			name: "String dedupe",
-			a:    &model.String{"a", model.Time(100)},
-			b:    &model.String{"a", model.Time(100)},
-			r:    &model.String{"a", model.Time(100)},
-		},
-
-		// Fill missing
-		{
-			name: "string fill missing",
-			a:    &model.String{"a", model.Time(100)},
-			b:    &model.String{"", model.Time(100)},
-			r:    &model.String{"a", model.Time(100)},
-		},
-
-		// Fill missing
-		{
-			name: "string fill missing",
-			a:    &model.String{"", model.Time(100)},
-			b:    &model.String{"a", model.Time(100)},
-			r:    &model.String{"a", model.Time(100)},
-		},
-
-		//
-		// Vector tests
-		{
-			name: "Vector dedupe",
-			a: model.Vector([]*model.Sample{
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-			}),
-			b: model.Vector([]*model.Sample{
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-			}),
-			r: model.Vector([]*model.Sample{
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-			}),
-		},
-
-		{
-			name: "Vector dedupe multiseries",
-			a: model.Vector([]*model.Sample{
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("metrica")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("metricb")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-			}),
-			b: model.Vector([]*model.Sample{
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("metrica")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-			}),
-			r: model.Vector([]*model.Sample{
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("metrica")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("metricb")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-			}),
-		},
-
-		// Fill missing
-		{
-			name: "Vector fill missing1",
-			a: model.Vector([]*model.Sample{
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-			}),
-			b: model.Vector([]*model.Sample{}),
-			r: model.Vector([]*model.Sample{
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-			}),
-		},
-
-		// Fill missing
-		{
-			name: "Vector fill missing2",
-			a:    model.Vector([]*model.Sample{}),
-			b: model.Vector([]*model.Sample{
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-			}),
-			r: model.Vector([]*model.Sample{
-				{
-					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
-					model.SampleValue(10),
-					model.Time(100),
-				},
-			}),
-		},
-
 		//
 		// Matrix tests
 		{
@@ -211,6 +50,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			b: model.Matrix([]*model.SampleStream{
@@ -220,6 +60,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			r: model.Matrix([]*model.SampleStream{
@@ -229,6 +70,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 		},
@@ -242,6 +84,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 				{
 					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hostb")}),
@@ -249,6 +92,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			b: model.Matrix([]*model.SampleStream{
@@ -258,6 +102,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			r: model.Matrix([]*model.SampleStream{
@@ -267,6 +112,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 				{
 					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hostb")}),
@@ -274,6 +120,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 		},
@@ -288,6 +135,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			b: model.Matrix([]*model.SampleStream{
@@ -297,6 +145,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(200),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			r: model.Matrix([]*model.SampleStream{
@@ -312,6 +161,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 		},
@@ -333,6 +183,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			b: model.Matrix([]*model.SampleStream{
@@ -352,6 +203,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			r: model.Matrix([]*model.SampleStream{
@@ -379,6 +231,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			antiAffinity: model.Time(20),
@@ -402,6 +255,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			b: model.Matrix([]*model.SampleStream{
@@ -417,6 +271,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			r: model.Matrix([]*model.SampleStream{
@@ -432,6 +287,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			antiAffinity: model.Time(100),
@@ -448,6 +304,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			b: model.Matrix([]*model.SampleStream{
@@ -457,6 +314,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(101),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			r: model.Matrix([]*model.SampleStream{
@@ -466,6 +324,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			antiAffinity: model.Time(2),
@@ -483,6 +342,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(101),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			b: model.Matrix([]*model.SampleStream{
@@ -492,6 +352,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			r: model.Matrix([]*model.SampleStream{
@@ -501,6 +362,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(101),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			antiAffinity: model.Time(2),
@@ -512,6 +374,7 @@ func TestMergeValues(t *testing.T) {
 				{
 					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
 					[]model.SamplePair{},
+					nil,
 				},
 			}),
 			b: model.Matrix([]*model.SampleStream{
@@ -521,6 +384,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			r: model.Matrix([]*model.SampleStream{
@@ -530,6 +394,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			antiAffinity: model.Time(2),
@@ -544,12 +409,14 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			b: model.Matrix([]*model.SampleStream{
 				{
 					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
 					[]model.SamplePair{},
+					nil,
 				},
 			}),
 			r: model.Matrix([]*model.SampleStream{
@@ -559,6 +426,7 @@ func TestMergeValues(t *testing.T) {
 						model.Time(100),
 						model.SampleValue(10),
 					}},
+					nil,
 				},
 			}),
 			antiAffinity: model.Time(2),
@@ -580,6 +448,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			b: model.Matrix([]*model.SampleStream{
@@ -611,6 +480,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			r: model.Matrix([]*model.SampleStream{
@@ -642,6 +512,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			antiAffinity: model.Time(2),
@@ -674,6 +545,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			b: model.Matrix([]*model.SampleStream{
@@ -697,6 +569,7 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			r: model.Matrix([]*model.SampleStream{
@@ -720,22 +593,516 @@ func TestMergeValues(t *testing.T) {
 							model.SampleValue(10),
 						},
 					},
+					nil,
 				},
 			}),
 			antiAffinity: model.Time(10),
+		},
+		// preferMax with antiAffinity set to 0
+		{
+			name: "preferMax with antiAffinity set to 0",
+			a: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(1),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(3),
+							model.SampleValue(20),
+						},
+						{
+							model.Time(6),
+							model.SampleValue(10),
+						},
+					},
+					nil,
+				},
+			}),
+			b: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(1),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(2),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(3),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(4),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(5),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(6),
+							model.SampleValue(10),
+						},
+					},
+					nil,
+				},
+			}),
+			r: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(1),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(2),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(3),
+							model.SampleValue(20),
+						},
+						{
+							model.Time(4),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(5),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(6),
+							model.SampleValue(10),
+						},
+					},
+					nil,
+				},
+			}),
+			antiAffinity: model.Time(0),
+			preferMax:    true,
+		},
+		// preferMax with antiAffinity equal to scrape interval
+		{
+			name: "preferMax with antiAffinity equal to scrape interval",
+			a: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(1),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(3),
+							model.SampleValue(20),
+						},
+						{
+							model.Time(6),
+							model.SampleValue(20),
+						},
+					},
+					nil,
+				},
+			}),
+			b: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(1),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(2),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(3),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(4),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(5),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(6),
+							model.SampleValue(10),
+						},
+					},
+					nil,
+				},
+			}),
+			r: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(1),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(2),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(3),
+							model.SampleValue(20),
+						},
+						{
+							model.Time(4),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(5),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(6),
+							model.SampleValue(20),
+						},
+					},
+					nil,
+				},
+			}),
+			antiAffinity: model.Time(1),
+			preferMax:    true,
+		},
+		// preferMax with antiAffinity smaller than scrape interval
+		{
+			name: "preferMax with antiAffinity smaller than scrape interval",
+			a: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(10),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(30),
+							model.SampleValue(20),
+						},
+						{
+							model.Time(60),
+							model.SampleValue(20),
+						},
+					},
+					nil,
+				},
+			}),
+			b: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(10),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(20),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(30),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(40),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(50),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(60),
+							model.SampleValue(10),
+						},
+					},
+					nil,
+				},
+			}),
+			r: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(10),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(20),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(30),
+							model.SampleValue(20),
+						},
+						{
+							model.Time(40),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(50),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(60),
+							model.SampleValue(20),
+						},
+					},
+					nil,
+				},
+			}),
+			antiAffinity: model.Time(1),
+			preferMax:    true,
+		},
+		// preferMax with antiAffinity larger than scrape interval
+		{
+			name: "preferMax with antiAffinity larger than scrape interval",
+			a: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(1),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(3),
+							model.SampleValue(20),
+						},
+						{
+							model.Time(6),
+							model.SampleValue(20),
+						},
+					},
+					nil,
+				},
+			}),
+			b: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(1),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(2),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(3),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(4),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(5),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(6),
+							model.SampleValue(10),
+						},
+					},
+					nil,
+				},
+			}),
+			r: model.Matrix([]*model.SampleStream{
+				{
+					model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")}),
+					[]model.SamplePair{
+						{
+							model.Time(1),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(2),
+							model.SampleValue(10),
+						},
+						{
+							model.Time(3),
+							model.SampleValue(20),
+						},
+						{
+							model.Time(4),
+							model.SampleValue(20),
+						},
+						{
+							model.Time(5),
+							model.SampleValue(20),
+						},
+						{
+							model.Time(6),
+							model.SampleValue(20),
+						},
+					},
+					nil,
+				},
+			}),
+			antiAffinity: model.Time(2),
+			preferMax:    true,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			result, err := MergeValues(test.antiAffinity, test.a, test.b)
-			if err != test.err {
-				t.Fatalf("mismatch err in %s expected=%v actual=%v", test.name, test.err, err)
-			}
+			result := mergeMatrix(test.antiAffinity, false, test.a, test.b, test.preferMax)
 			if !reflect.DeepEqual(result, test.r) {
 				t.Fatalf("mismatch in %s \nexpected=%v\nactual=%v", test.name, test.r, result)
 			}
 		})
 	}
 
+}
+
+// hist returns a tiny SampleHistogramPair whose Histogram value encodes the
+// supplied "tag" so test assertions can identify which side of the merge
+// produced it. Bucket structure is intentionally trivial — the merge logic
+// dedups by timestamp only.
+func hist(t int64, tag float64) model.SampleHistogramPair {
+	return model.SampleHistogramPair{
+		Timestamp: model.Time(t),
+		Histogram: &model.SampleHistogram{
+			Count: model.FloatString(tag),
+			Sum:   model.FloatString(tag),
+		},
+	}
+}
+
+func TestMergeMatrixHistograms(t *testing.T) {
+	metric := model.Metric(model.LabelSet{model.MetricNameLabel: model.LabelValue("hosta")})
+
+	tests := []struct {
+		name         string
+		a, b, r      model.Matrix
+		antiAffinity model.Time
+	}{
+		{
+			name: "histograms only on side A",
+			a: model.Matrix{{
+				Metric:     metric,
+				Histograms: []model.SampleHistogramPair{hist(100, 1), hist(200, 1)},
+			}},
+			b: model.Matrix{{
+				Metric: metric,
+			}},
+			r: model.Matrix{{
+				Metric:     metric,
+				Histograms: []model.SampleHistogramPair{hist(100, 1), hist(200, 1)},
+			}},
+		},
+		{
+			name: "histogram fill across hole",
+			a: model.Matrix{{
+				Metric:     metric,
+				Histograms: []model.SampleHistogramPair{hist(100, 1), hist(500, 1)},
+			}},
+			b: model.Matrix{{
+				Metric:     metric,
+				Histograms: []model.SampleHistogramPair{hist(100, 2), hist(300, 2), hist(500, 2)},
+			}},
+			r: model.Matrix{{
+				Metric:     metric,
+				Histograms: []model.SampleHistogramPair{hist(100, 2), hist(300, 2), hist(500, 2)},
+			}},
+			antiAffinity: model.Time(20),
+		},
+		{
+			name: "anti-affinity drops near-duplicate histogram",
+			a: model.Matrix{{
+				Metric:     metric,
+				Histograms: []model.SampleHistogramPair{hist(100, 1)},
+			}},
+			b: model.Matrix{{
+				Metric:     metric,
+				Histograms: []model.SampleHistogramPair{hist(101, 2)},
+			}},
+			r: model.Matrix{{
+				Metric:     metric,
+				Histograms: []model.SampleHistogramPair{hist(100, 1)},
+			}},
+			antiAffinity: model.Time(2),
+		},
+		{
+			// Float and histogram sequences are deduped independently. Side
+			// `b` has more histograms, so the histogram merge picks it as
+			// the base; the float merge sees an equal count and keeps `a`.
+			name: "mixed float + histogram series merges both sequences",
+			a: model.Matrix{{
+				Metric:     metric,
+				Values:     []model.SamplePair{{Timestamp: 100, Value: 1}, {Timestamp: 200, Value: 1}},
+				Histograms: []model.SampleHistogramPair{hist(150, 1)},
+			}},
+			b: model.Matrix{{
+				Metric:     metric,
+				Values:     []model.SamplePair{{Timestamp: 100, Value: 2}, {Timestamp: 200, Value: 2}},
+				Histograms: []model.SampleHistogramPair{hist(150, 2), hist(250, 2)},
+			}},
+			r: model.Matrix{{
+				Metric:     metric,
+				Values:     []model.SamplePair{{Timestamp: 100, Value: 1}, {Timestamp: 200, Value: 1}},
+				Histograms: []model.SampleHistogramPair{hist(150, 2), hist(250, 2)},
+			}},
+			antiAffinity: model.Time(20),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := mergeMatrix(test.antiAffinity, false, test.a, test.b, false)
+			if !reflect.DeepEqual(result, test.r) {
+				t.Fatalf("mismatch in %s\nexpected=%v\nactual=%v", test.name, test.r, result)
+			}
+		})
+	}
+}
+
+func TestToAnnotationError_StripsPositionSuffix(t *testing.T) {
+	cases := []struct {
+		in  string
+		out string
+	}{
+		{
+			in:  `PromQL warning: vector contains a mix of classic and native histograms for metric name "series" (1:25)`,
+			out: `PromQL warning: vector contains a mix of classic and native histograms for metric name "series"`,
+		},
+		{
+			in:  `PromQL info: ignored timestamp clause (12:34)`,
+			out: `PromQL info: ignored timestamp clause`,
+		},
+		{
+			// No position — passthrough.
+			in:  `PromQL warning: something happened`,
+			out: `PromQL warning: something happened`,
+		},
+		{
+			// Non-prefixed warning still gets the position stripped.
+			in:  `plain warning text (5:6)`,
+			out: `plain warning text`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got := toAnnotationError(tc.in).Error()
+			if got != tc.out {
+				t.Fatalf("toAnnotationError(%q).Error() = %q, want %q", tc.in, got, tc.out)
+			}
+		})
+	}
 }

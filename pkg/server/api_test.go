@@ -4,9 +4,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -26,7 +27,7 @@ func TestUnauthenticatedServerFunctions(t *testing.T) {
 
 	server, err := CreateAndStart(bindAddr, "text", time.Second*5, nil, router, "")
 	if err != nil {
-		t.Fatalf("an error occured during creation of server: %s", err.Error())
+		t.Fatalf("an error occurred during creation of server: %s", err.Error())
 	}
 
 	client := &http.Client{
@@ -39,7 +40,7 @@ func TestUnauthenticatedServerFunctions(t *testing.T) {
 		t.Fatalf("could not make request to metrics endpoint: %s", err.Error())
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("could not read response body: %s", err.Error())
 	}
@@ -52,6 +53,38 @@ func TestUnauthenticatedServerFunctions(t *testing.T) {
 		t.Fatalf("could not find metric name 'go_goroutines' in response")
 	}
 	server.Close()
+}
+
+func TestServerEmitsConfiguredHeaders(t *testing.T) {
+	freePort, err := getFreePort()
+	if err != nil {
+		t.Fatalf("could not get a free port to run test: %s", err.Error())
+	}
+	bindAddr := fmt.Sprintf("localhost:%d", freePort)
+	router := httprouter.New()
+	router.HandlerFunc("GET", "/metrics", promhttp.Handler().ServeHTTP)
+
+	server, err := CreateAndStart(bindAddr, "text", time.Second*5, nil, router, "testdata/http-server-config.yml")
+	if err != nil {
+		t.Fatalf("an error occurred during creation of server: %s", err.Error())
+	}
+	defer server.Close()
+
+	time.Sleep(time.Millisecond * 5)
+	resp, err := (&http.Client{}).Get(fmt.Sprintf("http://%s/metrics", bindAddr))
+	if err != nil {
+		t.Fatalf("could not make request to metrics endpoint: %s", err.Error())
+	}
+
+	want := map[string]string{
+		"Content-Security-Policy": "default-src 'self';",
+		"X-Frame-Options":         "sameorigin",
+	}
+	for k, v := range want {
+		if got := resp.Header.Get(k); got != v {
+			t.Fatalf("header %s: got %q, want %q", k, got, v)
+		}
+	}
 }
 
 func TestAuthenticatedServerDoesNotStartupWithInvalidConfig(t *testing.T) {
@@ -84,7 +117,7 @@ func TestMutualTLSClientCannotConnectToAuthenticatedServerWithoutCerts(t *testin
 
 	server, err := CreateAndStart(bindAddr, "text", time.Second*5, nil, router, "testdata/tls-server-config.yml")
 	if err != nil {
-		t.Fatalf("an error occured during creation of server: %s", err.Error())
+		t.Fatalf("an error occurred during creation of server: %s", err.Error())
 	}
 
 	client := &http.Client{
@@ -114,7 +147,7 @@ func TestMutualTLSClientCanConnectToAuthenticatedServerWithCerts(t *testing.T) {
 
 	server, err := CreateAndStart(bindAddr, "text", time.Second*5, nil, router, "testdata/tls-server-config.yml")
 	if err != nil {
-		t.Fatalf("an error occured during creation of server: %s", err.Error())
+		t.Fatalf("an error occurred during creation of server: %s", err.Error())
 	}
 
 	client := setupAuthenticatedClient(t)
@@ -124,7 +157,7 @@ func TestMutualTLSClientCanConnectToAuthenticatedServerWithCerts(t *testing.T) {
 		t.Fatalf("could not make request to metrics endpoint: %s", err.Error())
 	}
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("could not read response body: %s", err.Error())
 	}
@@ -137,6 +170,45 @@ func TestMutualTLSClientCanConnectToAuthenticatedServerWithCerts(t *testing.T) {
 		t.Fatalf("could not find metric name 'go_goroutines' in response")
 	}
 	server.Close()
+}
+
+// TestLegacyFlatTLSConfigStillServesTLS ensures the pre-exporter-toolkit web
+// config schema, where TLS keys live at the top level instead of nested under
+// tls_server_config, continues to bring up a working TLS server. See #771.
+func TestLegacyFlatTLSConfigStillServesTLS(t *testing.T) {
+	freePort, err := getFreePort()
+	if err != nil {
+		t.Fatalf("could not get a free port to run test: %s", err.Error())
+	}
+	bindAddr := fmt.Sprintf("localhost:%d", freePort)
+	router := httprouter.New()
+	router.HandlerFunc("GET", "/metrics", promhttp.Handler().ServeHTTP)
+
+	server, err := CreateAndStart(bindAddr, "text", time.Second*5, nil, router, "testdata/legacy-tls-server-config.yml")
+	if err != nil {
+		t.Fatalf("an error occurred during creation of server: %s", err.Error())
+	}
+	defer server.Close()
+
+	client := setupAuthenticatedClient(t)
+
+	resp, err := client.Get(fmt.Sprintf("https://%s/metrics", bindAddr))
+	if err != nil {
+		t.Fatalf("could not make request to metrics endpoint: %s", err.Error())
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("could not read response body: %s", err.Error())
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("authenticated client was unable to make a request to the legacy-config server. Response body: %s", body)
+	}
+
+	if !strings.Contains(string(body), "go_goroutines") {
+		t.Fatalf("could not find metric name 'go_goroutines' in response")
+	}
 }
 
 func getFreePort() (int, error) {
@@ -154,7 +226,7 @@ func getFreePort() (int, error) {
 }
 
 func setupAuthenticatedClient(t *testing.T) *http.Client {
-	caCert, err := ioutil.ReadFile("testdata/test-ca.crt")
+	caCert, err := os.ReadFile("testdata/test-ca.crt")
 	if err != nil {
 		t.Fatalf("could not read ca certificate: %s", err)
 	}
